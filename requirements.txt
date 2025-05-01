@@ -1,0 +1,11 @@
+streamlit
+langchain_core
+langchain_community
+langchain_ollama
+langchain_text_splitters 
+pillow
+numpy
+pytesseract
+unstructured
+faiss-cpu
+tqdm
