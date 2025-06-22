@@ -9,7 +9,9 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
     DirectoryLoader, 
     UnstructuredFileLoader,
-    UnstructuredHTMLLoader
+    UnstructuredHTMLLoader,
+    UnstructuredPDFLoader,
+    UnstructuredWordDocumentLoader
 )
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 HTML_STORAGE_PATH = 'data/'
 IMAGE_STORAGE_PATH = 'data/'
 TEXT_STORAGE_PATH = 'data/'
+DOCUMENTS_DIR = 'data/'
 # Using ai-forever/ru-en-RoSBERTa from Hugging Face
 EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="ai-forever/ru-en-RoSBERTa")
 QDRANT_PATH = "qdrant_db"
@@ -55,20 +58,107 @@ def load_html_document(file_path):
         logger.info(f"Loading HTML file: {file_path}")
         loader = UnstructuredHTMLLoader(file_path)
         documents = loader.load()
-        logger.info(f"Successfully loaded {len(documents)} documents from {file_path}")
-        return documents
     except Exception as e:
-        logger.error(f"Error loading {file_path}: {str(e)}", exc_info=True)
+        logging.error(f"Error loading HTML document {file_path}: {str(e)}")
         return []
 
-def load_image_text(file_path):
+def load_pdf_document(file_path):
+    """Load a single PDF document using pdfminer.six."""
     try:
-        image = Image.open(file_path)
-        text = pytesseract.image_to_string(image)
-        return text
+        # Проверяем, что файл существует и имеет правильный размер
+        if not os.path.exists(file_path):
+            logging.error(f"File not found: {file_path}")
+            return []
+            
+        if os.path.getsize(file_path) == 0:
+            logging.error(f"Empty file: {file_path}")
+            return []
+            
+        from pdfminer.high_level import extract_text
+        from pdfminer.pdfparser import PDFParser
+        from pdfminer.pdfdocument import PDFDocument
+        from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
+        from pdfminer.converter import PDFPageAggregator
+        from pdfminer.layout import LAParams, LTTextBox, LTTextLine
+        
+        # Инициализируем ресурсы
+        rsrcmgr = PDFResourceManager()
+        laparams = LAParams()
+        device = PDFPageAggregator(rsrcmgr, laparams=laparams)
+        interpreter = PDFPageInterpreter(rsrcmgr, device)
+        
+        # Открываем PDF файл
+        with open(file_path, 'rb') as fp:
+            parser = PDFParser(fp)
+            doc = PDFDocument(parser)
+            
+            # Извлекаем текст
+            text = extract_text(file_path)
+            
+            # Создаем документ
+            return [Document(
+                page_content=text,
+                metadata={
+                    'source': file_path,
+                    'type': 'pdf'
+                }
+            )]
+    except ModuleNotFoundError as e:
+        if 'pdfminer' in str(e):
+            logging.error(f"Module pdfminer not found. Please install it with 'pip install pdfminer.six'")
+        else:
+            logging.error(f"Error loading PDF document {file_path}: {str(e)}")
     except Exception as e:
-        logger.error(f"Error processing image {file_path}: {str(e)}")
-        return ""
+        logging.error(f"Error loading PDF document {file_path}: {str(e)}")
+    return []
+
+def load_docx_document(file_path):
+    """Load a single DOCX document."""
+    try:
+        loader = UnstructuredWordDocumentLoader(file_path)
+        return loader.load()
+    except Exception as e:
+        logging.error(f"Error loading DOCX document {file_path}: {str(e)}")
+        return []
+
+def load_html_documents(directory):
+    logger.info(f"Loading HTML documents from {directory}...")
+    html_docs = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.lower().endswith('.html'):
+                file_path = os.path.join(root, file)
+                docs = load_html_document(file_path)
+                if docs:
+                    html_docs.extend(docs)
+    logger.info(f"Successfully loaded {len(html_docs)} HTML documents")
+    return html_docs
+
+def load_pdf_documents(directory):
+    logger.info(f"Loading PDF documents from {directory}...")
+    pdf_docs = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.lower().endswith('.pdf'):
+                file_path = os.path.join(root, file)
+                docs = load_pdf_document(file_path)
+                if docs:
+                    pdf_docs.extend(docs)
+    logger.info(f"Successfully loaded {len(pdf_docs)} PDF documents")
+    return pdf_docs
+
+def load_docx_documents(directory):
+    logger.info(f"Loading DOCX documents from {directory}...")
+    docx_docs = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.lower().endswith('.docx'):
+                file_path = os.path.join(root, file)
+                docs = load_docx_document(file_path)
+                if docs:
+                    docx_docs.extend(docs)
+    logger.info(f"Successfully loaded {len(docx_docs)} DOCX documents")
+    return docx_docs
 
 def load_html_documents(directory):
     logger.info(f"Loading HTML documents from {directory}...")
@@ -150,12 +240,17 @@ def process_documents():
     logger.info("Starting document processing...")
     
     try:
-        # Load and process documents
-        html_docs = load_html_documents(HTML_STORAGE_PATH)
-        image_texts = load_image_texts(IMAGE_STORAGE_PATH)
-        texts = load_text_files(TEXT_STORAGE_PATH)
+        # Load HTML documents
+        html_docs = load_html_documents(DOCUMENTS_DIR)
         
-        # Convert image texts to Document objects
+        # Load PDF documents
+        pdf_docs = load_pdf_documents(DOCUMENTS_DIR)
+        
+        # Load DOCX documents
+        docx_docs = load_docx_documents(DOCUMENTS_DIR)
+        
+        # Load image texts
+        image_texts = load_image_texts(DOCUMENTS_DIR)
         image_docs = [
             Document(
                 page_content=text,
@@ -165,13 +260,13 @@ def process_documents():
         ]
         
         # Combine all documents
-        all_documents = html_docs + image_docs + texts
+        all_documents = html_docs + image_docs + docx_docs + pdf_docs
         
         if not all_documents:
             logger.error("No valid documents found to process")
             return None
         
-        logger.info(f"Processing {len(all_documents)} total documents ({len(html_docs)} HTML, {len(image_docs)} images)")
+        logger.info(f"Processing {len(all_documents)} total documents ({len(html_docs)} HTML, {len(pdf_docs)} PDF, {len(docx_docs)} DOCX, {len(image_docs)} images)")
         
         # Chunk documents
         logger.info("Chunking documents...")

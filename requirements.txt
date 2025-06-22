@@ -16,3 +16,9 @@ torch
 huggingface-hub
 python-dotenv
 nest-asyncio
+python-docx
+unstructured
+pdfminer.six==20221105
+pi_heif>=0.22.0
+unstructured_inference>=0.8.1
+pdf2image>=1.17.0
