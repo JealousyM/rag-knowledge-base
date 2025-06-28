@@ -1,12 +1,8 @@
 import os
 import sys
-import time
-import requests
-import json
 import streamlit as st
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
-from langchain_qdrant import QdrantVectorStore
 from dotenv import load_dotenv
 from data_processing import COLLECTION_NAME
 
@@ -68,9 +64,8 @@ def setup_ui():
     </style>
     """, unsafe_allow_html=True)
     
-    st.title("📘 AI Ассистент с новым API")
+    st.title("📘 AI Ассистент")
     st.markdown("---")
-    st.info("Используется новейшее API Hugging Face Inference Providers")
 
 class VectorSearch:
     def __init__(self):
