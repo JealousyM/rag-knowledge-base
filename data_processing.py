@@ -8,20 +8,14 @@ from langchain_community.vectorstores import Qdrant
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
     DirectoryLoader, 
-    UnstructuredFileLoader,
     UnstructuredHTMLLoader,
-    UnstructuredPDFLoader,
     UnstructuredWordDocumentLoader
 )
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from ollama_embeddings import OllamaEmbeddings
 from langchain_core.documents import Document
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from PIL import Image
-import pytesseract
 from tqdm import tqdm
-import uuid
-import base64
 import nest_asyncio
 
 nest_asyncio.apply()
@@ -36,8 +30,8 @@ HTML_STORAGE_PATH = 'data/'
 IMAGE_STORAGE_PATH = 'data/'
 TEXT_STORAGE_PATH = 'data/'
 DOCUMENTS_DIR = 'data/'
-# Using ai-forever/ru-en-RoSBERTa from Hugging Face
-EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="ai-forever/ru-en-RoSBERTa")
+# Using Ollama for embeddings
+EMBEDDING_MODEL = OllamaEmbeddings(model_name="nomic-embed-text")
 QDRANT_PATH = "qdrant_db"
 COLLECTION_NAME = "documents"
 MAX_WORKERS = 4  # Number of parallel workers
@@ -235,22 +229,62 @@ def chunk_documents(raw_documents):
     return chunks
 
 def process_documents():
-    # Загрузка данных
     start_time = time.time()
     logger.info("Starting document processing...")
     
+    # Initialize Qdrant client
+    client = QdrantClient(host="localhost", port=6333)
+    
+    # Define vector size for Ollama's nomic-embed-text model
+    VECTOR_SIZE = 768
+    
+    # Check if collection exists, if yes, delete it to recreate with correct dimensions
     try:
-        # Load HTML documents
-        html_docs = load_html_documents(DOCUMENTS_DIR)
+        collections = client.get_collections()
+        collection_names = [collection.name for collection in collections.collections]
         
-        # Load PDF documents
+        if COLLECTION_NAME in collection_names:
+            logger.info(f"Collection '{COLLECTION_NAME}' exists. Deleting to recreate with correct dimensions...")
+            client.delete_collection(collection_name=COLLECTION_NAME)
+    except Exception as e:
+        logger.warning(f"Error checking collections: {str(e)}")
+    
+    # Create collection with correct vector size
+    logger.info(f"Creating collection '{COLLECTION_NAME}' with vector size {VECTOR_SIZE}")
+    client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config={
+            "text": models.VectorParams(
+                size=VECTOR_SIZE,
+                distance=models.Distance.COSINE
+            )
+        }
+    )
+    
+    # Load documents from different sources
+    documents = []
+    try:
+        logger.info("Loading text files...")
+        documents.extend(load_text_files(TEXT_STORAGE_PATH))
+        logger.info(f"Loaded {len(documents)} text documents")
+        
+        logger.info("Loading HTML files...")
+        html_docs = load_html_documents(HTML_STORAGE_PATH)
+        documents.extend(html_docs)
+        logger.info(f"Loaded {len(html_docs)} HTML documents")
+        
+        logger.info("Loading PDF files...")
         pdf_docs = load_pdf_documents(DOCUMENTS_DIR)
+        documents.extend(pdf_docs)
+        logger.info(f"Loaded {len(pdf_docs)} PDF documents")
         
-        # Load DOCX documents
+        logger.info("Loading DOCX files...")
         docx_docs = load_docx_documents(DOCUMENTS_DIR)
+        documents.extend(docx_docs)
+        logger.info(f"Loaded {len(docx_docs)} DOCX documents")
         
-        # Load image texts
-        image_texts = load_image_texts(DOCUMENTS_DIR)
+        logger.info("Loading images for OCR...")
+        image_texts = load_image_texts(IMAGE_STORAGE_PATH)
         image_docs = [
             Document(
                 page_content=text,
@@ -258,96 +292,88 @@ def process_documents():
             )
             for i, text in enumerate(image_texts) if text.strip()
         ]
+        documents.extend(image_docs)
+        logger.info(f"Processed {len(image_docs)} images")
         
-        # Combine all documents
-        all_documents = html_docs + image_docs + docx_docs + pdf_docs
-        
-        if not all_documents:
-            logger.error("No valid documents found to process")
+        if not documents:
+            logger.error("No documents were loaded. Check your data directory.")
             return None
-        
-        logger.info(f"Processing {len(all_documents)} total documents ({len(html_docs)} HTML, {len(pdf_docs)} PDF, {len(docx_docs)} DOCX, {len(image_docs)} images)")
-        
-        # Chunk documents
-        logger.info("Chunking documents...")
-        processed_chunks = chunk_documents(all_documents)
-        
-        # Initialize Qdrant client
-        client = QdrantClient(host="localhost", port=6333)
-        
-        # Check if collection exists
-        try:
-            collections = client.get_collections()
-            collection_names = [collection.name for collection in collections.collections]
             
-            if COLLECTION_NAME in collection_names:
-                logger.info(f"Collection '{COLLECTION_NAME}' already exists. Dropping and recreating...")
-                client.delete_collection(collection_name=COLLECTION_NAME)
-        except Exception as e:
-            logger.warning(f"Error checking collections: {str(e)}")
-        
-        # Create collection configuration with correct dimensions for Ru-en RoBERTa
-        VECTOR_SIZE = 1024  # Updated dimension size for ai-forever/ru-en-RoSBERTa
-        vectors_config = models.VectorParams(
-            size=VECTOR_SIZE,
-            distance=models.Distance.COSINE
-        )
-        
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=vectors_config,
-        )
-        logger.info(f"Created new collection '{COLLECTION_NAME}' with vector size {VECTOR_SIZE}")
-        
-        # Add documents to the collection using a simpler approach
-        from qdrant_client.http import models as rest
-        
-        # Convert documents to Qdrant points format
-        texts = [doc.page_content for doc in processed_chunks]
-        metadatas = [doc.metadata for doc in processed_chunks]
-        
-        # Generate embeddings
-        logger.info("Generating embeddings...")
-        embeddings = EMBEDDING_MODEL.embed_documents(texts)
-        
-        # Prepare points for upload
-        points = []
-        for idx, (text, metadata, embedding) in enumerate(zip(texts, metadatas, embeddings)):
-            points.append(
-                rest.PointStruct(
-                    id=idx,
-                    payload={
-                        "text": text,
-                        "metadata": metadata
-                    },
-                    vector=embedding,
+    except Exception as e:
+        logger.error(f"Error loading documents: {str(e)}", exc_info=True)
+        raise
+
+    # Split documents into chunks
+    logger.info("Chunking documents...")
+    chunks = chunk_documents(documents)
+    logger.info(f"Created {len(chunks)} chunks from {len(documents)} documents")
+    
+    if not chunks:
+        logger.warning("No document chunks were created. Check your input files.")
+        return None
+    
+    # Process chunks in batches to avoid memory issues
+    BATCH_SIZE = 50
+    total_chunks = len(chunks)
+    
+    logger.info(f"Processing {total_chunks} chunks in batches of {BATCH_SIZE}...")
+    
+    try:
+        # Process chunks in batches
+        for i in range(0, total_chunks, BATCH_SIZE):
+            batch = chunks[i:i+BATCH_SIZE]
+            logger.info(f"Processing batch {i//BATCH_SIZE + 1}/{(total_chunks-1)//BATCH_SIZE + 1}...")
+            
+            # Extract texts and metadatas for the current batch
+            batch_texts = [chunk.page_content for chunk in batch]
+            batch_metadatas = [chunk.metadata for chunk in batch]
+            
+            # Generate embeddings for the batch
+            logger.info(f"Generating embeddings for batch {i//BATCH_SIZE + 1}...")
+            batch_embeddings = EMBEDDING_MODEL.embed_documents(batch_texts)
+            
+            # Prepare points for Qdrant
+            points = []
+            for idx, (text, metadata, embedding) in enumerate(zip(batch_texts, batch_metadatas, batch_embeddings)):
+                points.append(
+                    models.PointStruct(
+                        id=i + idx,  # Use a unique ID for each point
+                        payload={
+                            "text": text,
+                            "metadata": metadata
+                        },
+                        vector={"text": embedding},  # Specify the vector name 'text' as defined in the collection
+                    )
                 )
+            
+            # Upload batch to Qdrant
+            logger.info(f"Uploading batch {i//BATCH_SIZE + 1} to Qdrant...")
+            client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=points,
+                wait=True
             )
         
-        # Upload points in batches
-        logger.info(f"Uploading {len(points)} points to Qdrant...")
-        client.upsert(
-            collection_name=COLLECTION_NAME,
-            points=points,
-            wait=True
-        )
-        
         # Create and return the vector store
-        from langchain_community.vectorstores.qdrant import Qdrant
         vector_store = Qdrant(
             client=client,
             collection_name=COLLECTION_NAME,
             embeddings=EMBEDDING_MODEL,
         )
         
-        logger.info("Documents indexed successfully")
-        logger.info(f"Qdrant index created in {time.time() - start_time:.2f} seconds")
-        
+        logger.info(f"Successfully processed and indexed {total_chunks} document chunks")
+        logger.info(f"Total processing time: {time.time() - start_time:.2f} seconds")
         return vector_store
         
     except Exception as e:
         logger.error(f"Error processing documents: {str(e)}", exc_info=True)
-        return None
+        # Try to clean up the collection if there was an error
+        try:
+            client.delete_collection(collection_name=COLLECTION_NAME)
+            logger.info("Cleaned up collection after error")
+        except Exception as cleanup_error:
+            logger.warning(f"Error cleaning up collection: {str(cleanup_error)}")
+        raise
 
 if __name__ == "__main__":
     vector_store = process_documents()

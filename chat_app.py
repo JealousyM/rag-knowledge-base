@@ -1,10 +1,12 @@
 import os
 import sys
+import json
 import streamlit as st
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient
 from dotenv import load_dotenv
 from data_processing import COLLECTION_NAME
+from ollama_embeddings import OllamaEmbeddings
+from prompts import SYSTEM_PROMPT, ERROR_NO_CONTEXT, ERROR_MODEL_UNAVAILABLE, ERROR_GENERIC
 
 # Критическое исправление для Windows + Streamlit + PyTorch
 if sys.platform == "win32":
@@ -75,10 +77,7 @@ class VectorSearch:
             timeout=10,
             prefer_grpc=False
         )
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="ai-forever/ru-en-RoSBERTa",
-            model_kwargs={'device': 'cpu'}
-        )
+        self.embeddings = OllamaEmbeddings(model_name="nomic-embed-text")
         self.collection_name = COLLECTION_NAME
         
         # Проверяем подключение и коллекцию при инициализации
@@ -147,10 +146,10 @@ class VectorSearch:
                     # Получаем вектор запроса
                     query_vector = self.embeddings.embed_query(search_query)
                     
-                    # Выполняем поиск в Qdrant
+                    # Выполняем поиск в Qdrant с указанием имени вектора
                     results = self.client.search(
                         collection_name=self.collection_name,
-                        query_vector=query_vector,
+                        query_vector=("text", query_vector),  # Указываем имя вектора 'text'
                         limit=k,
                         with_payload=True,
                         with_vectors=False
@@ -251,24 +250,7 @@ class OllamaAssistant:
         
     def _create_prompt(self, user_query, context):
         """Создаем промпт для модели Mistral"""
-        return f"""<s>[INST] <<SYS>>
-Ты - экспертный ассистент по технической документации. 
-Тебе будет предоставлен контекст из документов и вопрос пользователя.
-
-Инструкции по ответу:
-1. Внимательно изучи предоставленный контекст
-2. Если в контексте есть точный ответ на вопрос - приведи его
-3. Если информации недостаточно - укажи, что не нашел точного ответа
-4. Если вопрос содержит аббревиатуры или технические термины, попробуй найти их расшифровку
-5. Будь точен и лаконичен
-
-Контекст для анализа:
-{context}
-<</SYS>>
-
-Вопрос: {user_query}
-
-Дайте развернутый ответ на основе предоставленного контекста. Если точного ответа нет, укажите это. [/INST]"""
+        return SYSTEM_PROMPT.format(context=context, question=user_query)
 
     def generate_response(self, user_query, context):
         """Генерация ответа с использованием модели Mistral через Ollama"""
@@ -312,7 +294,7 @@ class OllamaAssistant:
                         
                         if not response_text:
                             print("Получен пустой ответ от модели")
-                            return "Извините, не удалось сгенерировать ответ. Пожалуйста, попробуйте еще раз."
+                            return ERROR_NO_CONTEXT
                             
                         # Удаляем дублирующийся промпт из ответа, если он есть
                         if response_text.startswith(prompt):
@@ -338,8 +320,8 @@ class OllamaAssistant:
                 error_msg = f"Ошибка сети: {str(e)}"
                 print(error_msg)  # Логируем ошибку в консоль
                 if attempt == self.max_retries - 1:
-                    st.error("Не удалось подключиться к серверу Ollama. Проверьте, что Ollama запущен.")
-                    return "Извините, не удалось подключиться к серверу. Пожалуйста, проверьте, что Ollama запущен, и попробуйте снова."
+                    st.error("Не удалось подключиться к серверу Ollama. Пожалуйста, проверьте, что Ollama запущен.")
+                    return ERROR_MODEL_UNAVAILABLE
                 time.sleep(self.retry_delay)
                 
             except Exception as e:
@@ -350,10 +332,10 @@ class OllamaAssistant:
                 
                 if attempt == self.max_retries - 1:
                     st.error("Произошла непредвиденная ошибка при генерации ответа.")
-                    return "Извините, произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте позже."
+                    return ERROR_GENERIC
                 time.sleep(self.retry_delay)
         
-        return "Не удалось получить ответ после нескольких попыток. Пожалуйста, проверьте настройки и попробуйте еще раз."
+        return ERROR_GENERIC
 
 def main():
     setup_ui()
