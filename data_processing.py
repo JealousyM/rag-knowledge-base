@@ -9,32 +9,39 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
     DirectoryLoader, 
     UnstructuredHTMLLoader,
-    UnstructuredWordDocumentLoader
+    UnstructuredWordDocumentLoader,
+    PyPDFLoader,
+    UnstructuredFileLoader
 )
-from ollama_embeddings import OllamaEmbeddings
 from langchain_core.documents import Document
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from tqdm import tqdm
 import nest_asyncio
+from sentence_transformers import SentenceTransformer
+from text_utils import optimize_for_embedding, split_into_semantic_chunks
 
 nest_asyncio.apply()
 
-# install requirements
-# pip install -r requirements.txt
-# Настройка логов
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Global settings
+HTTP_TIMEOUT = 120
+HTTP_MAX_RETRIES = 3
 HTML_STORAGE_PATH = 'data/'
 IMAGE_STORAGE_PATH = 'data/'
 TEXT_STORAGE_PATH = 'data/'
 DOCUMENTS_DIR = 'data/'
-# Using Ollama for embeddings
-EMBEDDING_MODEL = OllamaEmbeddings(model_name="nomic-embed-text")
+MODEL_PATH = 'model/ru-en-RoSBERTa'
+EMBEDDING_MODEL = SentenceTransformer(MODEL_PATH)
+
+VECTOR_SIZE = 1024  # RoSBERTa produces 1024-dimensional embeddings
 QDRANT_PATH = "qdrant_db"
 COLLECTION_NAME = "documents"
 MAX_WORKERS = 4  # Number of parallel workers
+BATCH_SIZE = 50   # Batch size for processing
 
 def load_text_files(directory):
     try:
@@ -57,9 +64,7 @@ def load_html_document(file_path):
         return []
 
 def load_pdf_document(file_path):
-    """Load a single PDF document using pdfminer.six."""
     try:
-        # Проверяем, что файл существует и имеет правильный размер
         if not os.path.exists(file_path):
             logging.error(f"File not found: {file_path}")
             return []
@@ -75,21 +80,17 @@ def load_pdf_document(file_path):
         from pdfminer.converter import PDFPageAggregator
         from pdfminer.layout import LAParams, LTTextBox, LTTextLine
         
-        # Инициализируем ресурсы
         rsrcmgr = PDFResourceManager()
         laparams = LAParams()
         device = PDFPageAggregator(rsrcmgr, laparams=laparams)
         interpreter = PDFPageInterpreter(rsrcmgr, device)
         
-        # Открываем PDF файл
         with open(file_path, 'rb') as fp:
             parser = PDFParser(fp)
             doc = PDFDocument(parser)
             
-            # Извлекаем текст
             text = extract_text(file_path)
             
-            # Создаем документ
             return [Document(
                 page_content=text,
                 metadata={
@@ -107,7 +108,6 @@ def load_pdf_document(file_path):
     return []
 
 def load_docx_document(file_path):
-    """Load a single DOCX document."""
     try:
         loader = UnstructuredWordDocumentLoader(file_path)
         return loader.load()
@@ -154,47 +154,6 @@ def load_docx_documents(directory):
     logger.info(f"Successfully loaded {len(docx_docs)} DOCX documents")
     return docx_docs
 
-def load_html_documents(directory):
-    logger.info(f"Loading HTML documents from {directory}...")
-    start_time = time.time()
-    documents = []
-    
-    try:
-        # Check if directory exists
-        if not os.path.exists(directory):
-            logger.error(f"Directory not found: {directory}")
-            return []
-            
-        # Get all .htm files
-        html_files = [f for f in os.listdir(directory) if f.endswith(".htm")]
-        logger.info(f"Found {len(html_files)} HTML files to process")
-        
-        if not html_files:
-            logger.warning(f"No HTML files found in {directory}")
-            return []
-        
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(load_html_document, os.path.join(directory, filename)): filename 
-                for filename in html_files
-            }
-            
-            for future in tqdm(as_completed(futures), total=len(html_files), desc="Loading HTML files"):
-                filename = futures[future]
-                try:
-                    docs = future.result()
-                    if docs:
-                        documents.extend(docs)
-                        logger.debug(f"Added {len(docs)} documents from {filename}")
-                except Exception as e:
-                    logger.error(f"Error processing {filename}: {str(e)}", exc_info=True)
-    except Exception as e:
-        logger.error(f"Unexpected error in load_html_documents: {str(e)}", exc_info=True)
-    finally:
-        logger.info(f"Loaded {len(documents)} documents in {time.time() - start_time:.2f} seconds")
-    
-    return documents
-
 def load_image_texts(directory):
     logger.info("Loading images and extracting text...")
     start_time = time.time()
@@ -216,52 +175,103 @@ def load_image_texts(directory):
     return texts
 
 def chunk_documents(raw_documents):
-    logger.info("Chunking documents...")
+    logger.info(f"Chunking {len(raw_documents)} documents semantically...")
     start_time = time.time()
-    # Adjusted chunk size for better performance with large documents
-    text_processor = RecursiveCharacterTextSplitter(
-        chunk_size=1000,  # Reduced chunk size for better processing
-        chunk_overlap=100,
-        add_start_index=True
+    
+    semantic_chunks = []
+    
+    for doc in raw_documents:
+        optimized_text = optimize_for_embedding(doc.page_content)
+        
+        text_chunks = split_into_semantic_chunks(
+            optimized_text,
+            max_chunk_size=400,  
+            overlap=50  
+        )
+        
+        for i, chunk_text in enumerate(text_chunks):
+            chunk_doc = Document(
+                page_content=chunk_text,
+                metadata={
+                    **doc.metadata,  
+                    "chunk": i,  
+                    "total_chunks": len(text_chunks)  
+                }
+            )
+            semantic_chunks.append(chunk_doc)
+    
+    logger.info(f"Chunked {len(raw_documents)} documents into {len(semantic_chunks)} semantic chunks in {time.time() - start_time:.2f} seconds")
+    return semantic_chunks
+
+def create_vector_store(client, collection_name, chunks):
+    logger.info("Creating vector store...")
+    start_time = time.time()
+    
+    # Always recreate collection for safety
+    try:
+        logger.info(f"Deleting collection '{collection_name}' if it exists")
+        client.delete_collection(collection_name=collection_name)
+        logger.info(f"Successfully deleted existing collection '{collection_name}'")
+    except Exception as e:
+        logger.info(f"Collection '{collection_name}' may not exist or could not be deleted: {str(e)}")
+    
+    # Create fresh collection
+    logger.info(f"Creating new collection '{collection_name}'")
+    client.create_collection(
+        collection_name=collection_name,
+        vectors_config=models.VectorParams(
+            size=VECTOR_SIZE,  
+            distance=models.Distance.COSINE,
+        ),
     )
-    chunks = text_processor.split_documents(raw_documents)
-    logger.info(f"Chunked {len(raw_documents)} documents into {len(chunks)} chunks in {time.time() - start_time:.2f} seconds.")
-    return chunks
+    
+    BATCH_SIZE = 100  
+    total_chunks = len(chunks)
+    
+    for i in range(0, total_chunks, BATCH_SIZE):
+        batch = chunks[i:i + BATCH_SIZE]
+        batch_ids = [i + idx for idx in range(len(batch))]
+        batch_texts = [chunk.page_content for chunk in batch]
+        batch_metadatas = [chunk.metadata for chunk in batch]
+        
+        # Generate embeddings with proper task prefix for documents
+        batch_embeddings = []
+        for text in batch_texts:
+            batch_embeddings.append(get_embeddings(text, task="search_document"))
+        
+        points = []
+        for idx, (doc_id, vector, metadata, text) in enumerate(zip(batch_ids, batch_embeddings, batch_metadatas, batch_texts)):
+            full_metadata = {**metadata, "text": text}
+            
+            points.append(
+                models.PointStruct(
+                    id=doc_id,  # Using integer ID
+                    vector=vector.tolist(),  
+                    payload=full_metadata
+                )
+            )
+        
+        client.upsert(
+            collection_name=collection_name,
+            points=points,
+            wait=True,
+        )
+    
+    vector_store = Qdrant(
+        client=client,
+        collection_name=collection_name,
+        embeddings=EMBEDDING_MODEL,
+    )
+    
+    logger.info(f"Successfully created vector store in {time.time() - start_time:.2f} seconds")
+    return vector_store
 
 def process_documents():
     start_time = time.time()
     logger.info("Starting document processing...")
     
-    # Initialize Qdrant client
     client = QdrantClient(host="localhost", port=6333)
-    
-    # Define vector size for Ollama's nomic-embed-text model
-    VECTOR_SIZE = 768
-    
-    # Check if collection exists, if yes, delete it to recreate with correct dimensions
-    try:
-        collections = client.get_collections()
-        collection_names = [collection.name for collection in collections.collections]
-        
-        if COLLECTION_NAME in collection_names:
-            logger.info(f"Collection '{COLLECTION_NAME}' exists. Deleting to recreate with correct dimensions...")
-            client.delete_collection(collection_name=COLLECTION_NAME)
-    except Exception as e:
-        logger.warning(f"Error checking collections: {str(e)}")
-    
-    # Create collection with correct vector size
-    logger.info(f"Creating collection '{COLLECTION_NAME}' with vector size {VECTOR_SIZE}")
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config={
-            "text": models.VectorParams(
-                size=VECTOR_SIZE,
-                distance=models.Distance.COSINE
-            )
-        }
-    )
-    
-    # Load documents from different sources
+
     documents = []
     try:
         logger.info("Loading text files...")
@@ -283,97 +293,50 @@ def process_documents():
         documents.extend(docx_docs)
         logger.info(f"Loaded {len(docx_docs)} DOCX documents")
         
-        logger.info("Loading images for OCR...")
+        logger.info("Loading image texts...")
         image_texts = load_image_texts(IMAGE_STORAGE_PATH)
-        image_docs = [
-            Document(
-                page_content=text,
-                metadata={"source": f"image_{i}", "type": "image"}
-            )
-            for i, text in enumerate(image_texts) if text.strip()
-        ]
-        documents.extend(image_docs)
-        logger.info(f"Processed {len(image_docs)} images")
+        documents.extend(image_texts)
+        logger.info(f"Loaded {len(image_texts)} image texts")
         
         if not documents:
-            logger.error("No documents were loaded. Check your data directory.")
+            logger.warning("No documents found.")
             return None
-            
-    except Exception as e:
-        logger.error(f"Error loading documents: {str(e)}", exc_info=True)
-        raise
-
-    # Split documents into chunks
-    logger.info("Chunking documents...")
-    chunks = chunk_documents(documents)
-    logger.info(f"Created {len(chunks)} chunks from {len(documents)} documents")
-    
-    if not chunks:
-        logger.warning("No document chunks were created. Check your input files.")
-        return None
-    
-    # Process chunks in batches to avoid memory issues
-    BATCH_SIZE = 50
-    total_chunks = len(chunks)
-    
-    logger.info(f"Processing {total_chunks} chunks in batches of {BATCH_SIZE}...")
-    
-    try:
-        # Process chunks in batches
-        for i in range(0, total_chunks, BATCH_SIZE):
-            batch = chunks[i:i+BATCH_SIZE]
-            logger.info(f"Processing batch {i//BATCH_SIZE + 1}/{(total_chunks-1)//BATCH_SIZE + 1}...")
-            
-            # Extract texts and metadatas for the current batch
-            batch_texts = [chunk.page_content for chunk in batch]
-            batch_metadatas = [chunk.metadata for chunk in batch]
-            
-            # Generate embeddings for the batch
-            logger.info(f"Generating embeddings for batch {i//BATCH_SIZE + 1}...")
-            batch_embeddings = EMBEDDING_MODEL.embed_documents(batch_texts)
-            
-            # Prepare points for Qdrant
-            points = []
-            for idx, (text, metadata, embedding) in enumerate(zip(batch_texts, batch_metadatas, batch_embeddings)):
-                points.append(
-                    models.PointStruct(
-                        id=i + idx,  # Use a unique ID for each point
-                        payload={
-                            "text": text,
-                            "metadata": metadata
-                        },
-                        vector={"text": embedding},  # Specify the vector name 'text' as defined in the collection
-                    )
-                )
-            
-            # Upload batch to Qdrant
-            logger.info(f"Uploading batch {i//BATCH_SIZE + 1} to Qdrant...")
-            client.upsert(
-                collection_name=COLLECTION_NAME,
-                points=points,
-                wait=True
-            )
         
-        # Create and return the vector store
-        vector_store = Qdrant(
-            client=client,
-            collection_name=COLLECTION_NAME,
-            embeddings=EMBEDDING_MODEL,
-        )
+        logger.info(f"Loaded {len(documents)} documents in total")
         
-        logger.info(f"Successfully processed and indexed {total_chunks} document chunks")
+        chunks = chunk_documents(documents)
+        logger.info(f"Created {len(chunks)} chunks from {len(documents)} documents")
+        
+        if not chunks:
+            logger.warning("No document chunks were created. Check your input files.")
+            return None
+        
+        vector_store = create_vector_store(client, COLLECTION_NAME, chunks)
+        
+        logger.info(f"Successfully processed and indexed {len(chunks)} document chunks")
         logger.info(f"Total processing time: {time.time() - start_time:.2f} seconds")
         return vector_store
-        
+    
     except Exception as e:
         logger.error(f"Error processing documents: {str(e)}", exc_info=True)
-        # Try to clean up the collection if there was an error
         try:
             client.delete_collection(collection_name=COLLECTION_NAME)
             logger.info("Cleaned up collection after error")
         except Exception as cleanup_error:
             logger.warning(f"Error cleaning up collection: {str(cleanup_error)}")
         raise
+
+def get_embeddings(text, task="search_document"):
+    """Generate embeddings with proper task prefix as per RoSBERTa model requirements"""
+    prefixed_text = f"{task}: {text}"
+    
+    embedding = EMBEDDING_MODEL.encode(
+        prefixed_text,
+        normalize_embeddings=True,
+        convert_to_numpy=False,
+        show_progress_bar=False
+    )
+    return embedding
 
 if __name__ == "__main__":
     vector_store = process_documents()

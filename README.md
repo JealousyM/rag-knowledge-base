@@ -1,21 +1,21 @@
 # RAG (Retrieval-Augmented Generation) Knowledge Base
 
-This project implements a Retrieval-Augmented Generation (RAG) system that allows you to process documents, store them in a vector database, and query them using natural language. The system uses Qdrant for vector storage, Hugging Face for embeddings, and Ollama's Mistral model for generating responses.
+This project implements a Retrieval-Augmented Generation (RAG) system that allows you to process documents, store them in a vector database, and query them using natural language. The system uses Qdrant for vector storage, Hugging Face's RoSBERTa for embeddings, and a local GGUF model (T-lite-it-1.0) for generating responses.
 
 ## Features
 
-- Document processing for various file formats (PDF, DOCX, HTML, plain text, images with OCR)
-- Vector embeddings using Hugging Face models
+- Document processing for various file formats (PDF, DOCX, HTML, plain text)
+- Vector embeddings using Hugging Face's RoSBERTa model
 - Vector storage and retrieval with Qdrant
-- Chat interface with Streamlit
-- Local LLM support via Ollama
+- Interactive chat interface with Gradio
+- Local LLM inference with llama-cpp-python
+- Hybrid search combining semantic and keyword-based retrieval
 
 ## Prerequisites
 
 - Python 3.8+
-- [Ollama](https://ollama.ai/) installed and running with Mistral model
-- [Qdrant](https://qdrant.tech/) vector database
-- [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) (for image processing)
+- [Qdrant](https://qdrant.tech/) vector database (running on localhost:6333)
+- [GGUF Model](https://huggingface.co/models?search=gguf) (T-lite-it-1.0-Q4_K_M-GGUF included)
 - [Poetry](https://python-poetry.org/) (recommended) or pip
 
 ## Installation
@@ -26,46 +26,35 @@ This project implements a Retrieval-Augmented Generation (RAG) system that allow
    cd rag
    ```
 
-2. Copy the environment file and set up your Hugging Face token:
+2. Create and activate a virtual environment (recommended):
    ```bash
-   cp .env.example .env
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
    ```
-   Edit the `.env` file and add your Hugging Face API token.
 
 3. Install dependencies:
-   Using Poetry:
-   ```bash
-   poetry install
-   ```
-   
-   Or using pip:
    ```bash
    pip install -r requirements.txt
    ```
 
-4. Install Tesseract OCR:
-   - **Windows**: Download and install from [UB Mannheim](https://github.com/UB-Mannheim/tesseract/wiki)
-   - **macOS**: `brew install tesseract`
-   - **Linux**: `sudo apt-get install tesseract-ocr` (Ubuntu/Debian)
-
-5. Download and run Qdrant (using Docker):
+4. Download and run Qdrant (using Docker):
    ```bash
    docker pull qdrant/qdrant
    docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
    ```
 
-6. Download the Mistral model with Ollama:
-   ```bash
-   ollama pull mistral
-   ```
+5. Download the GGUF model (if not included):
+   - The project includes a pre-configured model in `model/T-lite-it-1.0-Q4_K_M-GGUF/`
+   - To use a different model, update the path in `gradio_app.py`
 
 ## Project Structure
 
 - `data/` - Directory for storing documents to be processed
+- `model/` - Contains the GGUF model files
 - `data_processing.py` - Script for processing and indexing documents
-- `chat_app.py` - Streamlit-based chat interface
+- `rag_app.py` - Gradio-based chat interface
+- `prompts.py` - System prompts and templates
 - `requirements.txt` - Python dependencies
-- `.env` - Environment variables
 
 ## Usage
 
@@ -76,7 +65,6 @@ Place the documents you want to process in the `data/` directory. Supported form
 - PDF documents (.pdf)
 - Word documents (.docx)
 - HTML files (.html, .htm)
-- Images with text (.jpg, .png, etc.)
 
 ### 2. Process Documents
 
@@ -89,30 +77,26 @@ python data_processing.py
 This will:
 1. Load documents from the `data/` directory
 2. Split them into chunks
-3. Generate embeddings
+3. Generate embeddings using RoSBERTa
 4. Store them in the Qdrant database
 
 ### 3. Start the Chat Interface
 
-Make sure Ollama is running in the background:
+Start the Gradio chat interface:
 
 ```bash
-ollama serve
+python gradio_app.py
 ```
 
-In a new terminal, start the Streamlit application:
-
-```bash
-streamlit run chat_app.py
-```
-
-This will open a web browser with the chat interface where you can ask questions about your documents.
+This will start a local web server (usually at http://localhost:7860) with the chat interface where you can ask questions about your documents.
 
 ## Configuration
 
-You can modify the following settings in the code:
+You can customize the following aspects of the system:
 
-- Embedding model: Edit `data_processing.py` to change the Hugging Face model
+- **Model Parameters**: Adjust `n_ctx`, `n_threads`, and other parameters in the `GGUFModelAssistant` class
+- **Search Settings**: Modify the hybrid search parameters in `get_hybrid_search()`
+- **UI Settings**: Customize the Gradio interface in `create_demo()`
 - Chunk size and overlap: Adjust in `data_processing.py`
 - Qdrant connection: Modify the connection parameters in both `data_processing.py` and `chat_app.py`
 
@@ -120,16 +104,11 @@ You can modify the following settings in the code:
 
 ### Common Issues
 
-1. **Ollama connection issues**:
-   - Ensure Ollama is running (`ollama serve`)
-   - Check if the model is downloaded (`ollama list`)
-   - Verify the API is accessible at `http://localhost:11434`
-
-2. **Qdrant connection issues**:
+1. **Qdrant connection issues**:
    - Make sure Qdrant is running (`docker ps` should show the container)
    - Check if ports 6333 and 6334 are available
 
-3. **OCR issues**:
+2. **OCR issues**:
    - Verify Tesseract is installed and in your PATH
    - For non-English text, you might need to install additional language packs
 
@@ -146,8 +125,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - [LangChain](https://python.langchain.com/)
 - [Qdrant](https://qdrant.tech/)
 - [Hugging Face](https://huggingface.co/)
-- [Ollama](https://ollama.ai/)
-- [Streamlit](https://streamlit.io/)
 
 ---
 
