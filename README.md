@@ -1,6 +1,6 @@
 # RAG (Retrieval-Augmented Generation) Knowledge Base
 
-This project implements a Retrieval-Augmented Generation (RAG) system that allows you to process documents, store them in a vector database, and query them using natural language. The system uses Qdrant for vector storage, Hugging Face's RoSBERTa for embeddings, and a local GGUF model (T-lite-it-1.0) for generating responses.
+This project implements a Retrieval-Augmented Generation (RAG) system that allows you to process documents, store them in a vector database, and query them using natural language. The system uses Qdrant for vector storage, Hugging Face's RoSBERTa for embeddings, and a local GGUF model (T-lite-it-1.0) for generating responses. It also features LangGraph workflows for structured RAG pipelines and LangSmith tracing for monitoring and debugging.
 
 ## Features
 
@@ -10,6 +10,9 @@ This project implements a Retrieval-Augmented Generation (RAG) system that allow
 - Interactive chat interface with Gradio
 - Local LLM inference with llama-cpp-python
 - Hybrid search combining semantic and keyword-based retrieval
+- LangGraph integration for structured RAG workflows
+- LangSmith tracing for monitoring and debugging performance
+- Support for multiple document formats in vector storage (flexible field mapping)
 
 ## Prerequisites
 
@@ -17,6 +20,8 @@ This project implements a Retrieval-Augmented Generation (RAG) system that allow
 - [Qdrant](https://qdrant.tech/) vector database (running on localhost:6333)
 - [GGUF Model](https://huggingface.co/models?search=gguf) (T-lite-it-1.0-Q4_K_M-GGUF included)
 - [Poetry](https://python-poetry.org/) (recommended) or pip
+- LangChain and LangGraph (included in requirements.txt)
+- LangSmith API key (optional, for tracing and monitoring)
 
 ## Installation
 
@@ -34,6 +39,15 @@ This project implements a Retrieval-Augmented Generation (RAG) system that allow
 
 3. Install dependencies:
    ```bash
+   # For Ubuntu/Debian:
+   sudo apt-get update
+   sudo apt-get install -y build-essential cmake python3-dev python3-venv
+   
+   # For CentOS/RHEL:
+   sudo yum groupinstall -y "Development Tools"
+   sudo yum install -y cmake python3-devel
+   
+   # Install Python dependencies
    pip install -r requirements.txt
    ```
 
@@ -52,7 +66,7 @@ This project implements a Retrieval-Augmented Generation (RAG) system that allow
 - `data/` - Directory for storing documents to be processed
 - `model/` - Contains the GGUF model files
 - `data_processing.py` - Script for processing and indexing documents
-- `rag_app.py` - Gradio-based chat interface
+- `rag_app.py` - Main RAG application with LangGraph workflows and Gradio interface
 - `prompts.py` - System prompts and templates
 - `requirements.txt` - Python dependencies
 
@@ -85,7 +99,7 @@ This will:
 Start the Gradio chat interface:
 
 ```bash
-python gradio_app.py
+python rag_app.py
 ```
 
 This will start a local web server (usually at http://localhost:7860) with the chat interface where you can ask questions about your documents.
@@ -94,11 +108,13 @@ This will start a local web server (usually at http://localhost:7860) with the c
 
 You can customize the following aspects of the system:
 
-- **Model Parameters**: Adjust `n_ctx`, `n_threads`, and other parameters in the `GGUFModelAssistant` class
-- **Search Settings**: Modify the hybrid search parameters in `get_hybrid_search()`
+- **Model Parameters**: Adjust `n_ctx`, `n_threads`, and other parameters in the `LangChainAssistant` class
+- **Search Settings**: Modify the hybrid search parameters in `HybridSearch` class
 - **UI Settings**: Customize the Gradio interface in `create_demo()`
-- Chunk size and overlap: Adjust in `data_processing.py`
-- Qdrant connection: Modify the connection parameters in both `data_processing.py` and `chat_app.py`
+- **LangGraph Workflow**: Modify the RAG workflow in `RAGAssistant._create_rag_graph()`
+- **LangSmith Tracing**: Configure with environment variables `LANGCHAIN_API_KEY` and `LANGCHAIN_PROJECT`
+- **Chunk size and overlap**: Adjust in `data_processing.py`
+- **Qdrant connection**: Modify the connection parameters in `Config` class
 
 ## Troubleshooting
 
@@ -112,6 +128,15 @@ You can customize the following aspects of the system:
    - Verify Tesseract is installed and in your PATH
    - For non-English text, you might need to install additional language packs
 
+3. **Vector dimension mismatch**:
+   - If you see "Vector dimension error" from Qdrant, check the embedding dimensions in `SimpleEmbeddings`
+   - The system now automatically pads vectors to the expected 1024 dimensions
+
+4. **LangGraph and LangSmith integration**:
+   - Do not use `@trace` decorators on functions passed to LangGraph's `add_node`
+   - Instead, use `with trace(name="function_name"):` inside functions
+   - This prevents the "trace object not callable" error
+
 ### Memory Management
 
 For large document collections, you might need to increase the available memory for Python and Ollama.
@@ -123,6 +148,8 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Acknowledgements
 
 - [LangChain](https://python.langchain.com/)
+- [LangGraph](https://github.com/langchain-ai/langgraph)
+- [LangSmith](https://smith.langchain.com/)
 - [Qdrant](https://qdrant.tech/)
 - [Hugging Face](https://huggingface.co/)
 

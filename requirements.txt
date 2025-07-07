@@ -4,14 +4,37 @@ sentence-transformers
 qdrant-client
 python-dotenv
 requests
+tqdm
+nest-asyncio
 
-# For GGUF model
+# LangChain components
+langchain>=0.1.0
+langchain-community>=0.0.13
+langchain-core>=0.1.10
+langchain-text-splitters>=0.0.1
+dataclasses-json>=0.5.0
+langgraph>=0.0.21
+
+# Document loaders
+unstructured>=0.10.0  # For various document types
+pypdf>=3.0.0  # For PDF processing
+python-docx>=0.8.11  # For Word documents
+
+# Vector store and embeddings
+sentence-transformers>=2.2.2
+langchain-qdrant>=0.0.1
+
+# LangSmith for tracing and monitoring (optional)
+langsmith>=0.0.77
+
+# For GGUF model (optional)
 llama-cpp-python
 huggingface-hub
 
-# For UI
+# For UI (optional)
 gradio
 
-# For embeddings
+# For embeddings (optional)
+scikit-learn>=1.0.0
 torch
 transformers

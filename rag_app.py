@@ -2,15 +2,35 @@ import sys
 import logging
 import json
 import time
-from typing import List, Dict, Any, Tuple
+import os
+from typing import List, Dict, Any, Tuple, Optional, Annotated, TypedDict
 
 import gradio as gr
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 
+# LangChain imports
+from langchain_community.llms import LlamaCpp
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Qdrant
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
+from langchain.schema.runnable import RunnableConfig, RunnableLambda
+from langchain.schema.output_parser import StrOutputParser
+from langchain.prompts import ChatPromptTemplate
+from langchain.retrievers import BM25Retriever, EnsembleRetriever
+
+# LangGraph imports
+from langgraph.graph import END, StateGraph
+from langgraph.checkpoint.memory import MemorySaver
+
+# LangSmith tracing
+from langsmith import Client, trace
+
 # Local imports
 from prompts import SYSTEM_PROMPT
+from data_processing import RoSBERTaEmbeddings, Config
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,94 +45,342 @@ MAX_CONTEXT_CHUNKS = 8  # Максимальное количество чанк
 MAX_HISTORY_LENGTH = 10  # Максимальное количество сообщений в истории
 RETRIEVAL_ERROR_MESSAGE = "Извините, эта информация временно недоступна. Уточните детали у менеджера"
 MODEL_PATH = 'model/ru-en-RoSBERTa'
-EMBEDDING_MODEL = SentenceTransformer(MODEL_PATH)
+
+# Настройка LangSmith трейсинга
+LANGCHAIN_API_KEY = os.environ.get("LANGCHAIN_API_KEY")
+LANGCHAIN_PROJECT = os.environ.get("LANGCHAIN_PROJECT", "rag_assistant")
+
+# Инициализация компонентов
+# Загружаем модель для эмбеддингов из data_processing.py
+# Так как мы уже загрузили модель в data_processing.py, мы используем ее напрямую
+from data_processing import EMBEDDING_MODEL
 
 class HybridSearch:
-    """Класс для выполнения гибридного поиска (векторный + ключевой)"""
+    """Класс для выполнения гибридного поиска с использованием LangChain EnsembleRetriever"""
     
     def __init__(self, collection_name: str = COLLECTION_NAME):
-        self.collection_name = collection_name
-        self.client = QdrantClient(host="localhost", port=6333)
-        logger.info(f"Инициализирован HybridSearch с коллекцией: {collection_name}")
+        """
+        Инициализация гибридного поиска с использованием LangChain
+        
+        Args:
+            collection_name: Имя коллекции в Qdrant
+        """
+        self.client = QdrantClient(host=Config.QDRANT_HOST, port=Config.QDRANT_PORT)
+        
+        # Инициализируем обертку эмбеддингов для LangChain
+        self.embeddings = RoSBERTaEmbeddings(EMBEDDING_MODEL)
+        
+        # Создаем векторный поиск на основе Qdrant
+        try:
+            # Используем векторное хранилище через LangChain
+            self.vector_store = Qdrant(
+                client=self.client,
+                collection_name=collection_name,
+                embeddings=self.embeddings,
+                vector_name=None
+            )
+            
+            # Создаем векторный ретривер
+            self.vector_retriever = self.vector_store.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": MAX_CONTEXT_CHUNKS, "score_threshold": 0.5}
+            )
+            
+            # Получаем все документы для построения BM25 индекса
+            all_docs = []
+            try:
+                # Проверяем информацию о коллекции
+                try:
+                    collection_info = self.client.get_collection(collection_name=collection_name)
+                    logger.info(f"Информация о коллекции {collection_name}: размер = {collection_info.vectors_count}")
+                except Exception as e:
+                    logger.error(f"Ошибка при получении информации о коллекции: {str(e)}")
+
+                # Получаем до 10000 документов для построения индекса
+                logger.info(f"Попытка загрузки документов из коллекции {collection_name}")
+                scroll_result = self.client.scroll(
+                    collection_name=collection_name,
+                    limit=10000,
+                    with_payload=True,
+                    with_vectors=False
+                )
+                
+                # Проверяем результат
+                logger.info(f"Результат scroll: тип = {type(scroll_result)}, длина = {len(scroll_result)}")
+                
+                if len(scroll_result) > 0 and len(scroll_result[0]) > 0:
+                    # Проверяем первый документ
+                    first_point = scroll_result[0][0]
+                    logger.info(f"Первый документ: id={first_point.id}, ключи в payload: {list(first_point.payload.keys() if first_point.payload else [])}")
+                
+                points = scroll_result[0]
+                
+                # Конвертируем в формат документов LangChain
+                for point in points:
+                    try:
+                        # Поддержка обоих форматов документов
+                        content = None
+                        metadata = {}
+                        
+                        if not point.payload:
+                            logger.warning(f"Point {point.id} не имеет payload")
+                            continue
+                            
+                        # Вариант 1: контент в 'text'
+                        if 'text' in point.payload:
+                            content = point.payload['text']
+                            metadata = {k: v for k, v in point.payload.items() if k != 'text'}
+                            
+                        # Вариант 2: контент в 'page_content'
+                        elif 'page_content' in point.payload:
+                            content = point.payload['page_content']
+                            # Проверяем метаданные в поле 'metadata'
+                            if 'metadata' in point.payload and isinstance(point.payload['metadata'], dict):
+                                metadata = point.payload['metadata']
+                            else:
+                                # Все остальные поля как метаданные
+                                metadata = {k: v for k, v in point.payload.items() if k != 'page_content'}
+                            
+                        # Создаем документ, если нашли контент
+                        if content:
+                            doc = Document(
+                                page_content=content,
+                                metadata=metadata
+                            )
+                            all_docs.append(doc)
+                        else:
+                            logger.warning(f"Не найден контент в документе {point.id}. Ключи: {list(point.payload.keys())}")
+                    except Exception as doc_error:
+                        logger.error(f"Ошибка при обработке документа: {str(doc_error)}")
+                        continue
+                
+                logger.info(f"Загружено {len(all_docs)} документов для BM25 индекса")
+                
+                # Отладка - показываем первый документ, если есть
+                if all_docs and len(all_docs) > 0:
+                    first_doc = all_docs[0]
+                    logger.info(f"Первый документ для BM25: \nсодержимое: '{first_doc.page_content[:100]}...'\nметаданные: {first_doc.metadata}")
+                    logger.debug("Найдены следующие первые 5 документов:")
+                    for i, doc in enumerate(all_docs[:5]):
+                        logger.debug(f"Doc {i+1}: {doc.page_content[:50]}...")
+            except Exception as e:
+                logger.error(f"Ошибка при загрузке документов для BM25: {str(e)}")
+                all_docs = []
+            
+            # Создаем BM25 ретривер
+            if all_docs:
+                self.bm25_retriever = BM25Retriever.from_documents(all_docs)
+                self.bm25_retriever.k = 8
+                
+                # Создаем ансамбль для гибридного поиска
+                self.ensemble_retriever = EnsembleRetriever(
+                    retrievers=[self.vector_retriever, self.bm25_retriever],
+                    weights=[0.7, 0.3]
+                )
+                logger.info("Инициализирован гибридный поиск (Qdrant + BM25)")
+            else:
+                # Если не удалось загрузить документы, используем только векторный поиск
+                self.ensemble_retriever = self.vector_retriever
+                logger.info("Инициализирован только векторный поиск (без BM25)")
+                
+        except Exception as e:
+            logger.error(f"Ошибка при инициализации поиска: {str(e)}")
+            raise
     
     def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         """
-        Выполняет гибридный поиск, комбинируя семантический и ключевой поиск
+        Выполняет гибридный поиск, используя LangChain EnsembleRetriever
+        
+        Args:
+            query: Поисковый запрос
+            k: Количество результатов
+            
+        Returns:
+            Список релевантных документов с метаданными и оценками
         """
         start_time = time.time()
         try:
-            results = get_hybrid_search(query, k)
-            logger.info(f"Найдено {len(results)} релевантных документов за {time.time() - start_time:.2f} сек")
-            return results
+            # Проверяем наличие запроса
+            if not query or query.strip() == "":
+                logger.warning("Пустой запрос, поиск не выполняется")
+                return []
+                
+            logger.info(f"Выполняем поиск для запроса: '{query}'")
+            
+            # Выполняем поиск через LangChain retriever
+            # Используем trace внутри функции вместо декоратора
+            with trace(name="search"):
+                try:
+                    results = self.ensemble_retriever.get_relevant_documents(query)
+                    logger.info(f"Получено {len(results)} документов через ретривер")
+                    
+                    # Проверка и отладка - показываем первый документ, если есть
+                    if results and len(results) > 0:
+                        first_doc = results[0]
+                        logger.info(f"Первый результат: \nсодержимое: '{first_doc.page_content[:100]}...'\nметаданные: {first_doc.metadata}")
+                except Exception as search_error:
+                    logger.error(f"Ошибка при поиске: {str(search_error)}")
+                    
+                    # Пробуем прямой поиск через Qdrant
+                    logger.info("Попытка прямого поиска через Qdrant...")
+                    try:
+                        # Преобразуем запрос в эмбеддинг
+                        query_vector = self.embeddings.embed_query(query)
+                        
+                        # Выполняем прямой поиск через Qdrant
+                        search_result = self.client.search(
+                            collection_name=COLLECTION_NAME,
+                            query_vector=query_vector,
+                            limit=k,
+                            with_payload=True
+                        )
+                        logger.info(f"Прямой поиск через Qdrant вернул {len(search_result)} результатов")
+                        
+                        # Проверяем формат результатов
+                        if search_result and len(search_result) > 0:
+                            first = search_result[0]
+                            if hasattr(first, 'payload'):
+                                logger.info(f"Ключи в payload первого результата: {list(first.payload.keys())}")
+                        
+                        # Преобразуем в формат LangChain Document
+                        results = []
+                        for point in search_result:
+                            if point.payload:
+                                content = None
+                                metadata = {}
+                                
+                                # Поддержка обоих форматов
+                                if 'text' in point.payload:
+                                    content = point.payload['text']
+                                    metadata = {k: v for k, v in point.payload.items() if k != 'text'}
+                                elif 'page_content' in point.payload:
+                                    content = point.payload['page_content']
+                                    if 'metadata' in point.payload and isinstance(point.payload['metadata'], dict):
+                                        metadata = point.payload['metadata']
+                                    else:
+                                        metadata = {k: v for k, v in point.payload.items() if k != 'page_content'}
+                                
+                                if content:
+                                    doc = Document(
+                                        page_content=content,
+                                        metadata=metadata
+                                    )
+                                    results.append(doc)
+                    except Exception as qdrant_error:
+                        logger.error(f"Ошибка при прямом поиске через Qdrant: {str(qdrant_error)}")
+                        results = []
+            
+            # Преобразуем результаты в формат, совместимый с предыдущей версией
+            processed_results = []
+            for i, doc in enumerate(results[:k]):
+                # Создаем объект, имитирующий ScoredPoint из Qdrant
+                # Сохраняем формат оригинального документа
+                payload = {
+                    'page_content': doc.page_content  # Используем оригинальное поле
+                }
+                
+                # Метаданные могут быть как отдельным полем, так и на уровне payload
+                if hasattr(doc, 'metadata') and doc.metadata:
+                    payload['metadata'] = doc.metadata
+                
+                # Дублируем и в text для обратной совместимости
+                payload['text'] = doc.page_content
+                
+                result = type('ScoredPoint', (), {
+                    'score': 1.0 - (i * 0.1),  # Имитация оценки от 1.0 до 0.5
+                    'payload': payload,
+                    'id': f"result_{i}"  # Добавляем ID для удобства отладки
+                })
+                processed_results.append(result)
+            
+            # Показываем первый результат для отладки
+            if processed_results and len(processed_results) > 0:
+                first_result = processed_results[0]
+                logger.info(f"Первый обработанный результат: id={first_result.id}, ключи в payload: {list(first_result.payload.keys())}")
+                
+                # Показываем содержимое
+                if 'page_content' in first_result.payload:
+                    logger.info(f"page_content: {first_result.payload['page_content'][:100]}...")
+                elif 'text' in first_result.payload:
+                    logger.info(f"text: {first_result.payload['text'][:100]}...")
+            
+            logger.info(f"Найдено {len(processed_results)} релевантных документов за {time.time() - start_time:.2f} сек")
+            return processed_results
         except Exception as e:
             logger.error(f"Ошибка при поиске: {str(e)}")
             return []
 
-from llama_cpp import Llama
-
-class GGUFModelAssistant:
-    """Класс для работы с локальной GGUF моделью"""
+class LangChainAssistant:
+    """Класс для работы с LLM моделью через LangChain"""
     
     def __init__(self, model_path: str = "model/T-lite-it-1.0-Q4_K_M-GGUF/t-lite-it-1.0-q4_k_m.gguf"):
         self.model_path = model_path
         self.llm = None
         self._load_model()
-        logger.info(f"Инициализирован ассистент с моделью: {model_path}")
+        logger.info(f"Инициализирован LangChain ассистент с моделью: {model_path}")
     
     def _load_model(self):
-        """Загружает GGUF модель"""
+        """Загружает модель через LangChain LLAMACPP интеграцию"""
         try:
-            # Инициализируем модель с настройками для CPU
-            self.llm = Llama(
+            # Инициализируем модель через LangChain
+            self.llm = LlamaCpp(
                 model_path=self.model_path,
-                n_ctx=2048,  # Контекстное окно
-                n_threads=6,  # Количество потоков для обработки
-                n_gpu_layers=0,  # 0 для использования только CPU
-                verbose=False
+                temperature=0.4,
+                max_tokens=768,
+                top_p=0.9,
+                stop=["</s>", "<|im_end|>"],
+                verbose=False,
+                n_ctx=2048,
+                n_threads=8,
+                n_gpu_layers=0
             )
-            logger.info("Модель успешно загружена")
+            logger.info("Модель успешно загружена через LangChain")
             
         except Exception as e:
-            logger.error(f"Ошибка при загрузке модели: {str(e)}")
+            logger.error(f"Ошибка при загрузке модели через LangChain: {str(e)}")
             raise RuntimeError(f"Не удалось загрузить модель: {str(e)}")
     
     def generate_response(self, messages: List[Dict[str, str]]) -> str:
         """
-        Генерирует ответ от языковой модели
+        Генерирует ответ от языковой модели с использованием LangChain
+        
+        Args:
+            messages: Список сообщений в формате {"role": "...", "content": "..."}
+            
+        Returns:
+            Сгенерированный ответ модели
         """
         try:
-            if not self.llm:
-                logger.error("Попытка генерации ответа при незагруженной модели")
-                raise RuntimeError("Модель не загружена")
-            
-            logger.info("Получен запрос на генерацию ответа")
-            logger.debug(f"Входные сообщения: {messages}")
-            
-            # Форматируем сообщения в промпт
-            prompt = self._format_messages(messages)
-            logger.debug(f"Сформированный промпт: {prompt[:200]}...")  # Логируем начало промпта
-            
-            # Генерируем ответ
-            logger.info("Запуск генерации ответа...")
-            start_time = time.time()
-            
-            response = self.llm(
-                prompt=prompt,
-                max_tokens=1024,
-                temperature=0.7,
-                top_p=0.9,
-                echo=False,
-                stop=["</s>", "<|im_end|>"]
-            )
-            
-            # Извлекаем сгенерированный текст
-            generated_text = response['choices'][0]['text'].strip()
-            
-            end_time = time.time()
-            logger.info(f"Ответ сгенерирован за {end_time - start_time:.2f} секунд")
-            logger.debug(f"Сгенерированный ответ: {generated_text[:200]}...")  # Логируем начало ответа
-            
-            return generated_text
+            # Используем trace внутри функции вместо декоратора
+            with trace(name="generate_response"):
+                if not self.llm:
+                    logger.error("Попытка генерации ответа при незагруженной модели")
+                    raise RuntimeError("Модель не загружена")
+                
+                logger.info("Получен запрос на генерацию ответа")
+                logger.debug(f"Входные сообщения: {messages}")
+                
+                # Форматируем сообщения в промпт
+                prompt = self._format_messages(messages)
+                logger.debug(f"Сформированный промпт: {prompt[:200]}...")  # Логируем начало промпта
+                
+                # Генерируем ответ через LangChain
+                logger.info("Запуск генерации ответа через LangChain...")
+                start_time = time.time()
+                
+                # Используем вызов LangChain
+                # Создаем конфигурацию прямо, а не как контекстный менеджер
+                config = {
+                    "callbacks": None,
+                    "run_name": "generate_response"
+                }
+                generated_text = self.llm.invoke(prompt, config=config)
+                
+                end_time = time.time()
+                logger.info(f"Ответ сгенерирован за {end_time - start_time:.2f} секунд")
+                logger.debug(f"Сгенерированный ответ: {generated_text[:200]}...")  # Логируем начало ответа
+                
+                return generated_text.strip()
             
         except Exception as e:
             logger.error(f"Ошибка при генерации ответа: {str(e)}", exc_info=True)
@@ -136,27 +404,146 @@ class GGUFModelAssistant:
         formatted.append("<|im_start|>assistant\n")
         return "\n".join(formatted)
 
+# Определяем тип состояния для LangGraph
+class RAGState(TypedDict):
+    """State for the RAG workflow"""
+    question: str
+    chat_history: List[List[str]]
+    context: List[Document]
+    formatted_context: str
+    answer: Optional[str] = None
+    sources: List[Dict] = []
+
 class RAGAssistant:
     """
-    Основной класс для системы поиска и ответов на вопросы
-    Интегрирует гибридный поиск и локальную GGUF модель
+    Основной класс для системы RAG с использованием LangChain и LangGraph
+    Интегрирует гибридный поиск и LLM для ответов на вопросы
     """
     
     def __init__(self):
-        logger.info("Инициализация RAGAssistant...")
+        logger.info("Инициализация RAGAssistant с LangGraph...")
         try:
+            # Инициализируем компоненты
             self.search_engine = HybridSearch()
-            logger.info("Инициализирован поисковый движок")
+            logger.info("Инициализирован поисковый движок LangChain")
             
-            logger.info("Загрузка GGUF модели...")
-            self.assistant = GGUFModelAssistant()
-            logger.info("GGUF модель успешно загружена")
+            logger.info("Загрузка LLM модели через LangChain...")
+            self.assistant = LangChainAssistant()
+            logger.info("LLM модель успешно загружена")
+            
+            # Создаем LangGraph для процесса RAG
+            self.graph = self._create_rag_graph()
             
             self.feedback_data = []  # Для хранения обратной связи
-            logger.info("RAGAssistant успешно инициализирован с локальной GGUF моделью")
+            logger.info("RAGAssistant успешно инициализирован с LangChain и LangGraph")
         except Exception as e:
             logger.error(f"Ошибка при инициализации RAGAssistant: {str(e)}", exc_info=True)
             raise
+    
+    def _create_rag_graph(self):
+        """
+        Создает граф LangGraph для процесса Retrieval-Augmented Generation
+        """
+        # Создаем новый граф
+        workflow = StateGraph(RAGState)
+        
+        # Определяем узлы графа
+        
+        # 1. Поиск релевантных документов
+        def retrieve_documents(state: RAGState) -> RAGState:
+            try:
+                logger.info(f"Выполняется поиск по запросу: {state['question']}")
+                # Используем trace внутри функции
+                with trace(name="retrieve_documents"):
+                    search_results = self.search_engine.search(state['question'])
+                
+                if not search_results:
+                    logger.warning("Не найдены релевантные документы")
+                    # Преобразуем в формат Document для совместимости
+                    state['context'] = []
+                    state['formatted_context'] = ""
+                    state['sources'] = []
+                    return state
+                
+                # Форматируем результаты поиска
+                formatted_context, sources = self.format_search_results(search_results)
+                
+                # Преобразуем в формат Document для LangChain
+                documents = []
+                for source in sources:
+                    doc = Document(
+                        page_content=source['text'],
+                        metadata=source['metadata']
+                    )
+                    documents.append(doc)
+                
+                state['context'] = documents
+                state['formatted_context'] = formatted_context
+                state['sources'] = sources
+                
+                logger.info(f"Найдено {len(documents)} релевантных документов")
+                return state
+            except Exception as e:
+                logger.error(f"Ошибка при поиске документов: {str(e)}")
+                # В случае ошибки продолжаем с пустым контекстом
+                state['context'] = []
+                state['formatted_context'] = ""
+                state['sources'] = []
+                return state
+        
+        # 2. Генерация ответа на основе контекста
+        def generate_answer(state: RAGState) -> RAGState:
+            try:
+                # Проверяем, есть ли контекст
+                if not state['context']:
+                    state['answer'] = RETRIEVAL_ERROR_MESSAGE
+                    return state
+                    
+                # Создаем системное сообщение с контекстом и вопросом
+                system_message = {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT.format(
+                        context=state['formatted_context'], 
+                        question=state['question']
+                    )
+                }
+                messages = [system_message]
+                
+                # Добавляем историю диалога (не больше MAX_HISTORY_LENGTH сообщений)
+                for user_msg, assistant_msg in state['chat_history'][-MAX_HISTORY_LENGTH:]:
+                    messages.append({"role": "user", "content": user_msg})
+                    messages.append({"role": "assistant", "content": assistant_msg})
+                
+                # Добавляем текущий запрос
+                messages.append({"role": "user", "content": state['question']})
+                
+                # Генерируем ответ
+                logger.info("Генерация ответа...")
+                # Используем trace внутри функции
+                with trace(name="generate_answer"):
+                    response = self.assistant.generate_response(messages)
+                
+                state['answer'] = response
+                return state
+                
+            except Exception as e:
+                logger.error(f"Ошибка при генерации ответа: {str(e)}")
+                state['answer'] = f"Произошла ошибка при обработке запроса: {str(e)}"
+                return state
+                
+        # Добавляем узлы в граф
+        workflow.add_node("retrieve", retrieve_documents)
+        workflow.add_node("generate", generate_answer)
+        
+        # Определяем порядок выполнения
+        workflow.set_entry_point("retrieve")
+        workflow.add_edge("retrieve", "generate")
+        workflow.add_edge("generate", END)
+        
+        # Создаем и компилируем граф
+        graph = workflow.compile()
+        logger.info("Создан и скомпилирован LangGraph для RAG")
+        return graph
     
     def format_search_results(self, results: List) -> Tuple[str, List[Dict]]:
         """
@@ -202,7 +589,7 @@ class RAGAssistant:
 
     def answer_query(self, query: str, history: List[List[str]]) -> Tuple[str, List[Dict]]:
         """
-        Отвечает на вопрос с использованием RAG
+        Отвечает на вопрос с использованием LangGraph RAG процесса
         
         Args:
             query: Текущий запрос пользователя
@@ -212,37 +599,42 @@ class RAGAssistant:
             Кортеж (ответ, список источников)
         """
         try:
-            # Выполняем поиск по запросу
-            search_results = self.search_engine.search(query)
+            logger.info(f"Обработка запроса: {query}")
             
-            if not search_results:
-                return RETRIEVAL_ERROR_MESSAGE, []
-            
-            # Форматируем результаты поиска
-            context, context_chunks = self.format_search_results(search_results)
-            
-            # Создаем системное сообщение с контекстом и вопросом
-            system_message = {
-                "role": "system",
-                "content": SYSTEM_PROMPT.format(context=context, question=query)
+            # Создаем начальное состояние для LangGraph
+            initial_state = {
+                "question": query,
+                "chat_history": history,
+                "context": [],
+                "formatted_context": "",
+                "answer": None,
+                "sources": []
             }
-            messages = [system_message]
             
-            # Добавляем историю диалога (не больше MAX_HISTORY_LENGTH сообщений)
-            for user_msg, assistant_msg in history[-MAX_HISTORY_LENGTH:]:
-                messages.append({"role": "user", "content": user_msg})
-                messages.append({"role": "assistant", "content": assistant_msg})
+            # Создаем конфигурацию для трейсинга в LangSmith
+            config = {}
+            if LANGCHAIN_API_KEY:
+                config = {
+                    "configurable": {
+                        "project_name": LANGCHAIN_PROJECT,
+                        "tags": ["rag", "production"]
+                    }
+                }
             
-            # Добавляем текущий запрос
-            messages.append({"role": "user", "content": query})
+            # Запускаем LangGraph
+            logger.info("Запуск LangGraph RAG процесса...")
+            # Используем trace внутри функции вместо декоратора
+            with trace(name="answer_query"):
+                final_state = self.graph.invoke(initial_state, config=config)
             
-            # Получаем ответ от модели
-            response = self.assistant.generate_response(messages)
+            # Получаем результаты
+            answer = final_state.get("answer", RETRIEVAL_ERROR_MESSAGE)
+            sources = final_state.get("sources", [])
             
-            return response, context_chunks
+            return answer, sources
         
         except Exception as e:
-            logger.error(f"Ошибка при обработке запроса: {str(e)}", exc_info=True)
+            logger.error(f"Ошибка при обработке запроса через LangGraph: {str(e)}", exc_info=True)
             return f"Произошла ошибка при обработке запроса: {str(e)}", []
     
     def save_feedback(self, query: str, response: str, rating: int, comments: str = ""):
@@ -498,6 +890,7 @@ def get_hybrid_search(query, k=5):
     """
     Perform hybrid search using Qdrant's built-in hybrid search capabilities.
     Combines vector similarity with keyword matching in a single query.
+    Performs case-insensitive search by converting both query and text to lowercase.
     
     Args:
         query: Search query string
@@ -506,86 +899,79 @@ def get_hybrid_search(query, k=5):
     Returns:
         List of search results with combined scores
     """
-    client = QdrantClient(host="localhost", port=6333)
-    
     try:
+        client = QdrantClient(host="localhost", port=6333)
         logger.info(f"Performing hybrid search for query: {query}")
         
-        # Get query embedding with search_query prefix
+        # Generate query embedding
         try:
-            query_vector = get_embeddings_with_prefix(query, task="search_query")
-            if not isinstance(query_vector, list) or len(query_vector) == 0:
-                raise ValueError("Invalid query vector format")
+            query_embedding = get_embeddings_with_prefix(query, task="search_query")[0]
         except Exception as e:
             logger.error(f"Error generating query embedding: {str(e)}")
             return []
         
         try:
-            # Create a text search condition
-            from qdrant_client import models
+            # Convert query to lowercase for case-insensitive search
+            query_lower = query.lower()
             
             # Split query into words for better matching
-            query_terms = query.split()
+            query_terms = [term for term in query_lower.split() if len(term) > 2]  # Only terms longer than 2 chars
             
-            # Create a filter for text search (at least one term must match)
-            text_conditions = []
-            for term in query_terms:
-                if len(term) > 2:  # Only include terms longer than 2 characters
-                    text_conditions.append(
-                        models.FieldCondition(
-                            key="text",
-                            match=models.MatchText(text=term)
-                        )
-                    )
-            
-            # Perform hybrid search with text conditions if any
-            if text_conditions:
+            # If no valid query terms, just do vector search
+            if not query_terms:
                 search_results = client.search(
                     collection_name=COLLECTION_NAME,
-                    query_vector=query_vector[0],
-                    query_filter=models.Filter(
-                        should=text_conditions,  # At least one term should match
-                        must=[
-                            models.Filter(
-                                should=text_conditions,
-                            )
-                        ]
-                    ),
-                    limit=k*2,
-                    with_payload=True,
-                    score_threshold=0.3  # Minimum similarity score
-                )
-            else:
-                # If no text conditions, just do vector search
-                search_results = client.search(
-                    collection_name=COLLECTION_NAME,
-                    query_vector=query_vector[0],
-                    limit=k*2,
+                    query_vector=query_embedding,
+                    limit=k,
                     with_payload=True,
                     score_threshold=0.3
                 )
+                return search_results
             
-            logger.info(f"Found {len(search_results)} hybrid search results")
-            return search_results
+            # Get more results than needed to account for filtering
+            search_results = client.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=query_embedding,
+                limit=k*3,  # Get more results initially to filter
+                with_payload=True,
+                score_threshold=0.3  # Minimum similarity score
+            )
+            
+            # Filter results case-insensitively
+            filtered_results = []
+            for result in search_results:
+                text = result.payload.get('text', '').lower()
+                # Check if all query terms are in the text (case-insensitive)
+                if all(term in text for term in query_terms):
+                    filtered_results.append(result)
+                    if len(filtered_results) >= k:
+                        break
+                        
+            # If no results after filtering, return the top vector results
+            if not filtered_results and search_results:
+                return search_results[:k]
+                
+            return filtered_results
             
         except Exception as e:
-            logger.error(f"Error in hybrid search: {str(e)}")
-            # Fallback to simple vector search if hybrid fails
+            logger.error(f"Error during hybrid search: {str(e)}", exc_info=True)
+            # Fallback to simple vector search if hybrid search fails
             try:
                 search_results = client.search(
                     collection_name=COLLECTION_NAME,
-                    query_vector=query_vector[0],
-                    limit=k*2,
-                    with_payload=True
+                    query_vector=query_embedding,
+                    limit=k,
+                    with_payload=True,
+                    score_threshold=0.3
                 )
                 logger.info(f"Falling back to vector search, found {len(search_results)} results")
                 return search_results
-            except Exception as fallback_error:
-                logger.error(f"Error in fallback vector search: {str(fallback_error)}")
+            except Exception as e2:
+                logger.error(f"Error in fallback vector search: {str(e2)}")
                 return []
                 
     except Exception as e:
-        logger.error(f"Unexpected error in hybrid search: {str(e)}")
+        logger.error(f"Error initializing Qdrant client: {str(e)}")
         return []
 
 # Запуск приложения
