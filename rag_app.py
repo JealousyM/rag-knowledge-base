@@ -315,6 +315,17 @@ class HybridSearch:
 class LangChainAssistant:
     """Класс для работы с LLM моделью через LangChain"""
     
+    # Параметры модели по умолчанию
+    model_params = {
+        "temperature": 0.4,
+        "max_tokens": 768,
+        "top_p": 0.9,
+        "verbose": True,
+        "n_ctx": 2048,
+        "n_threads": 8,
+        "n_gpu_layers": 0
+    }
+    
     def __init__(self, model_path: str = "model/T-lite-it-1.0-Q4_K_M-GGUF/t-lite-it-1.0-q4_k_m.gguf"):
         self.model_path = model_path
         self.llm = None
@@ -324,19 +335,20 @@ class LangChainAssistant:
     def _load_model(self):
         """Загружает модель через LangChain LLAMACPP интеграцию"""
         try:
-            # Инициализируем модель через LangChain
+            # Инициализируем модель через LangChain с использованием параметров из model_params
             self.llm = LlamaCpp(
                 model_path=self.model_path,
-                temperature=0.4,
-                max_tokens=768,
-                top_p=0.9,
+                temperature=self.model_params["temperature"],
+                max_tokens=self.model_params["max_tokens"],
+                top_p=self.model_params["top_p"],
                 stop=["</s>", "<|im_end|>"],
-                verbose=False,
-                n_ctx=2048,
-                n_threads=8,
-                n_gpu_layers=0
+                verbose=self.model_params["verbose"],
+                n_ctx=self.model_params["n_ctx"],
+                n_threads=self.model_params["n_threads"],
+                n_gpu_layers=self.model_params["n_gpu_layers"]
             )
             logger.info("Модель успешно загружена через LangChain")
+            logger.info(f"Параметры модели: {self.model_params}")
             
         except Exception as e:
             logger.error(f"Ошибка при загрузке модели через LangChain: {str(e)}")
@@ -405,6 +417,38 @@ class LangChainAssistant:
         # Добавляем приглашение для модели
         formatted.append("<|im_start|>assistant\n")
         return "\n".join(formatted)
+        
+    def update_model_params(self, **kwargs):
+        """Обновляет параметры модели и перезагружает её
+        
+        Args:
+            **kwargs: Именованные аргументы с новыми значениями параметров
+            
+        Returns:
+            bool: True если модель была успешно перезагружена, False в случае ошибки
+        """
+        try:
+            # Обновляем параметры
+            for param, value in kwargs.items():
+                if param in self.model_params:
+                    # Преобразуем типы для числовых параметров
+                    if param in ["temperature", "top_p"]:
+                        value = float(value)
+                    elif param in ["max_tokens", "n_ctx", "n_threads", "n_gpu_layers"]:
+                        value = int(value)
+                    elif param == "verbose":
+                        value = bool(value)
+                    
+                    self.model_params[param] = value
+            
+            logger.info(f"Обновление параметров модели: {kwargs}")
+            
+            # Перезагружаем модель с новыми параметрами
+            self._load_model()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении параметров модели: {str(e)}")
+            return False
 
 # Определяем тип состояния для LangGraph
 class RAGState(TypedDict):
@@ -864,40 +908,106 @@ def create_demo(rag_assistant):
     """Создает демонстрационный интерфейс Gradio"""
     with gr.Blocks(css="footer {visibility: hidden}") as demo:
         gr.Markdown("# 🔍 Система вопросов и ответов с гибридным поиском")        
-        with gr.Row():
-            with gr.Column(scale=3):
-                chatbot = gr.Chatbot(
-                    height=500, 
-                    label="Диалог",
-                    type="messages"  # Using the new messages format
-                )
-                msg = gr.Textbox(
-                    placeholder="Введите ваш вопрос...",
-                    label="Вопрос",
-                    lines=2
-                )
+        
+        # Создаем вкладки для основного интерфейса и настроек
+        with gr.Tabs() as tabs:
+            with gr.TabItem("Чат") as chat_tab:
                 with gr.Row():
-                    submit_btn = gr.Button("Отправить", variant="primary")
-                    clear_btn = gr.Button("Очистить")
-            
-            with gr.Column(scale=2):
-                sources_display = gr.HTML(label="Источники")
-                with gr.Group():  # Replaced Box with Group
-                    gr.Markdown("### Оцените ответ")
-                    with gr.Row():
-                        rating = gr.Slider(
-                            minimum=1, 
-                            maximum=5, 
-                            step=1, 
-                            value=3, 
-                            label="Оценка"
+                    with gr.Column(scale=3):
+                        chatbot = gr.Chatbot(
+                            height=500, 
+                            label="Диалог",
+                            type="messages"  # Using the new messages format
                         )
-                    comments = gr.Textbox(
-                        placeholder="Дополнительные комментарии...", 
-                        label="Комментарии"
+                        msg = gr.Textbox(
+                            placeholder="Введите ваш вопрос...",
+                            label="Вопрос",
+                            lines=2
+                        )
+                        with gr.Row():
+                            submit_btn = gr.Button("Отправить", variant="primary")
+                            clear_btn = gr.Button("Очистить")
+                    
+                    with gr.Column(scale=2):
+                        sources_display = gr.HTML(label="Источники")
+                        with gr.Group():  # Replaced Box with Group
+                            gr.Markdown("### Оцените ответ")
+                            with gr.Row():
+                                rating = gr.Slider(
+                                    minimum=1, 
+                                    maximum=5, 
+                                    step=1, 
+                                    value=3, 
+                                    label="Оценка"
+                                )
+                            comments = gr.Textbox(
+                                placeholder="Дополнительные комментарии...", 
+                                label="Комментарии"
+                            )
+                            feedback_btn = gr.Button("Отправить отзыв")
+                            feedback_status = gr.Markdown()
+                
+            with gr.TabItem("Настройки модели") as settings_tab:
+                with gr.Group():
+                    gr.Markdown("### Настройки языковой модели")
+                    temperature = gr.Slider(
+                        minimum=0.0, maximum=1.0, step=0.05, value=rag_assistant.assistant.model_params["temperature"],
+                        label="Temperature (влияет на креативность ответов)"
                     )
-                    feedback_btn = gr.Button("Отправить отзыв")
-                    feedback_status = gr.Markdown()
+                    max_tokens = gr.Slider(
+                        minimum=128, maximum=2048, step=64, value=rag_assistant.assistant.model_params["max_tokens"],
+                        label="Max Tokens (максимальное количество токенов в ответе)"
+                    )
+                    top_p = gr.Slider(
+                        minimum=0.0, maximum=1.0, step=0.05, value=rag_assistant.assistant.model_params["top_p"],
+                        label="Top P (влияет на распределение вероятностей токенов)"
+                    )
+                    n_ctx = gr.Slider(
+                        minimum=512, maximum=4096, step=512, value=rag_assistant.assistant.model_params["n_ctx"],
+                        label="Контекст (размер контекстного окна)"
+                    )
+                    n_threads = gr.Slider(
+                        minimum=1, maximum=16, step=1, value=rag_assistant.assistant.model_params["n_threads"],
+                        label="Потоки (количество потоков CPU)"
+                    )
+                    n_gpu_layers = gr.Slider(
+                        minimum=0, maximum=32, step=1, value=rag_assistant.assistant.model_params["n_gpu_layers"],
+                        label="GPU слои (количество слоев для GPU)"
+                    )
+                    verbose = gr.Checkbox(
+                        value=rag_assistant.assistant.model_params["verbose"],
+                        label="Подробный режим (verbose)"
+                    )
+                    
+                    settings_submit_btn = gr.Button("Сохранить настройки", variant="primary")
+                    settings_status = gr.Markdown()
+
+        # Мостик для перехода между вкладками
+        def change_tab_to_settings():
+            return gr.update(selected="Настройки модели")
+        
+        # Функция для обновления настроек модели
+        def update_model_settings(temp, max_tok, top_p_val, ctx, threads, gpu_layers, verb):
+            try:
+                result = rag_assistant.assistant.update_model_params(
+                    temperature=temp,
+                    max_tokens=max_tok,
+                    top_p=top_p_val,
+                    n_ctx=ctx,
+                    n_threads=threads,
+                    n_gpu_layers=gpu_layers,
+                    verbose=verb
+                )
+                if result:
+                    return "✅ Настройки успешно обновлены"
+                else:
+                    return "❌ Ошибка при обновлении настроек"
+            except Exception as e:
+                return f"❌ Ошибка: {str(e)}"
+        
+        # Функция для изменения вкладки
+        def select_tab_settings():
+            return gr.update(selected="Настройки модели")
         
         # Обработчики событий
         submit_btn.click(
@@ -921,6 +1031,22 @@ def create_demo(rag_assistant):
             submit_feedback,
             inputs=[rating, comments, chatbot],
             outputs=[feedback_status]
+        )
+        
+        # Добавляем кнопку перехода к настройкам в нижней части интерфейса
+        with gr.Row():
+            settings_btn = gr.Button("⚙️ Настройки модели")
+            
+        # Обработчики для настроек модели
+        settings_btn.click(
+            select_tab_settings,
+            outputs=[tabs]
+        )
+        
+        settings_submit_btn.click(
+            update_model_settings,
+            inputs=[temperature, max_tokens, top_p, n_ctx, n_threads, n_gpu_layers, verbose],
+            outputs=[settings_status]
         )
         
     return demo
