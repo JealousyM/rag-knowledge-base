@@ -1,6 +1,7 @@
 import sys
 import logging
 import json
+import uuid
 import time
 import os
 from typing import List, Dict, Any, Tuple, Optional, Annotated, TypedDict
@@ -43,6 +44,7 @@ load_dotenv()
 COLLECTION_NAME = "documents"
 MAX_CONTEXT_CHUNKS = 8  # Максимальное количество чанков для контекста
 MAX_HISTORY_LENGTH = 10  # Максимальное количество сообщений в истории
+LAST_RUN_ID = None  # Идентификатор последнего запуска в LangSmith для отзывов
 RETRIEVAL_ERROR_MESSAGE = "Извините, эта информация временно недоступна. Уточните детали у менеджера"
 MODEL_PATH = 'model/ru-en-RoSBERTa'
 
@@ -587,7 +589,7 @@ class RAGAssistant:
         
         return formatted_context, context_chunks
 
-    def answer_query(self, query: str, history: List[List[str]]) -> Tuple[str, List[Dict]]:
+    def answer_query(self, query: str, history: List[List[str]]) -> Tuple[str, List[Dict], Optional[str]]:
         """
         Отвечает на вопрос с использованием LangGraph RAG процесса
         
@@ -596,7 +598,7 @@ class RAGAssistant:
             history: История диалога в формате [[user_msg1, assistant_msg1], [user_msg2, assistant_msg2], ...]
             
         Returns:
-            Кортеж (ответ, список источников)
+            Кортеж (ответ, список источников, run_id для LangSmith)
         """
         try:
             logger.info(f"Обработка запроса: {query}")
@@ -613,6 +615,8 @@ class RAGAssistant:
             
             # Создаем конфигурацию для трейсинга в LangSmith
             config = {}
+            run_id = None
+            
             if LANGCHAIN_API_KEY:
                 config = {
                     "configurable": {
@@ -624,22 +628,39 @@ class RAGAssistant:
             # Запускаем LangGraph
             logger.info("Запуск LangGraph RAG процесса...")
             # Используем trace внутри функции вместо декоратора
-            with trace(name="answer_query"):
+            with trace(name="answer_query") as run:
                 final_state = self.graph.invoke(initial_state, config=config)
+                # Получаем run_id для LangSmith
+                if run is not None:
+                    run_id = run.id
+                    # Сохраняем в глобальной переменной для последующего доступа
+                    global LAST_RUN_ID
+                    LAST_RUN_ID = run_id
+                    logger.info(f"LangSmith run_id: {run_id} сохранен в LAST_RUN_ID")
             
             # Получаем результаты
             answer = final_state.get("answer", RETRIEVAL_ERROR_MESSAGE)
             sources = final_state.get("sources", [])
             
-            return answer, sources
-        
+            return answer, sources, run_id
+            
         except Exception as e:
             logger.error(f"Ошибка при обработке запроса через LangGraph: {str(e)}", exc_info=True)
-            return f"Произошла ошибка при обработке запроса: {str(e)}", []
+            return f"Произошла ошибка при обработке запроса: {str(e)}", [], None
     
-    def save_feedback(self, query: str, response: str, rating: int, comments: str = ""):
+    def save_feedback(self, query: str, response: str, rating: int, comments: str = "", run_id: Optional[str] = None):
         """
-        Сохраняет обратную связь пользователя
+        Сохраняет обратную связь пользователя локально и в LangSmith (если доступен)
+        
+        Args:
+            query: Запрос пользователя
+            response: Ответ системы
+            rating: Оценка (обычно 1-5)
+            comments: Комментарии пользователя
+            run_id: Идентификатор запуска в LangSmith
+            
+        Returns:
+            bool: Успешно ли сохранен отзыв
         """
         logger.info(f"Получен отзыв: оценка={rating}, комментарий={comments}")
         
@@ -648,20 +669,56 @@ class RAGAssistant:
             "query": query,
             "response": response,
             "rating": rating,
-            "comments": comments
+            "comments": comments,
+            "run_id": run_id
         }
         
         self.feedback_data.append(feedback)
+        success = True
         
-        # Сохраняем в файл
+        # Отправляем отзыв в LangSmith, если доступен run_id и API ключ
+        if run_id and LANGCHAIN_API_KEY:
+            try:
+                from langsmith.client import Client
+                
+                client = Client()
+                # Преобразуем рейтинг от 1-5 к формату LangSmith (от 1 до 10 или строка)
+                langsmith_score = None
+                if isinstance(rating, int):
+                    # Приводим рейтинг от 1-5 к шкале 1-10
+                    langsmith_score = min(10, rating * 2)
+                
+                # Отправляем отзыв в LangSmith
+                client.create_feedback(
+                    run_id=run_id,
+                    key="user_rating",
+                    score=langsmith_score,
+                    comment=comments,
+                    value=rating
+                )
+                logger.info(f"Отзыв успешно отправлен в LangSmith для run_id={run_id}")
+            except Exception as e:
+                logger.error(f"Ошибка при отправке отзыва в LangSmith: {str(e)}", exc_info=True)
+                success = False
+        
+        # Класс для сериализации UUID в JSON
+        class UUIDEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, uuid.UUID):
+                    # Convert UUID to string
+                    return str(obj)
+                return json.JSONEncoder.default(self, obj)
+        
+        # Сохраняем в локальный файл
         try:
             with open("feedback_data.json", "w", encoding="utf-8") as f:
-                json.dump(self.feedback_data, f, ensure_ascii=False, indent=2)
-            logger.info(f"Отзыв успешно сохранен. Рейтинг: {rating}")
-            return True
+                json.dump(self.feedback_data, f, ensure_ascii=False, indent=2, cls=UUIDEncoder)
+            logger.info(f"Отзыв успешно сохранен локально. Рейтинг: {rating}")
         except Exception as e:
-            logger.error(f"Ошибка при сохранении отзыва: {str(e)}")
-            return False
+            logger.error(f"Ошибка при сохранении отзыва в локальный файл: {str(e)}", exc_info=True)
+            success = False
+            
+        return success
 
 def chat_with_feedback(message, history):
     """
@@ -682,8 +739,8 @@ def chat_with_feedback(message, history):
             if i + 1 < len(history):
                 old_format_history.append([history[i]["content"], history[i+1]["content"]])
         
-        # Get response and sources
-        response, sources = rag_assistant.answer_query(message, old_format_history)
+        # Get response, sources and LangSmith run_id
+        response, sources, run_id = rag_assistant.answer_query(message, old_format_history)
         
         # Format sources for display
         sources_html = format_source_display(sources)
@@ -692,7 +749,8 @@ def chat_with_feedback(message, history):
         history.append({"role": "user", "content": message})
         history.append({"role": "assistant", "content": response})
         
-        logger.debug("Запрос пользователя и ответ ассистента добавлены в историю")
+        # run_id теперь сохраняется в глобальной переменной LAST_RUN_ID
+        logger.debug(f"Запрос пользователя и ответ ассистента добавлены в историю. Текущий LAST_RUN_ID: {LAST_RUN_ID}")
         
         # Ограничиваем длину истории
         if len(history) > MAX_HISTORY_LENGTH * 2:  # Умножаем на 2, так как каждая пара вопрос-ответ - это 2 элемента
@@ -727,8 +785,9 @@ def format_source_display(sources: List[Dict[str, Any]]) -> str:
     for i, source in enumerate(sources[:5]):  # Ограничиваем количество отображаемых источников
         # Извлекаем метаданные и текст, если они есть
         metadata = source.get('metadata', {})
-        source_name = metadata.get('source', 'Неизвестный источник')
-        page = metadata.get('page', '')
+        sub_metadata = metadata.get('metadata', {})
+        source_name = sub_metadata.get('source', 'Неизвестный источник')
+        page = sub_metadata.get('page', '')
         text = source.get('text', '')[:100]  # Берем первые 100 символов текста
         
         # Формируем отображаемое имя источника
@@ -754,10 +813,16 @@ def format_source_display(sources: List[Dict[str, Any]]) -> str:
 def clear_chat():
     """Очищает историю чата и возвращает пустые значения для всех элементов"""
     logger.info("Очистка истории чата")
+    
+    # Сбрасываем глобальный run_id при очистке чата
+    global LAST_RUN_ID
+    LAST_RUN_ID = None
+    logger.info("Сброс LAST_RUN_ID при очистке чата")
+    
     return [], "", ""  # Пустые значения для chat_history, sources_display, feedback_status
 
 def submit_feedback(rating, comments, history):
-    """Отправляет обратную связь о последнем ответе"""
+    """Отправляет обратную связь о последнем ответе и отправляет её в LangSmith"""
     logger.info(f"Получен отзыв: оценка={rating}, комментарий={comments}")
     
     if not history or len(history) < 2:
@@ -765,14 +830,28 @@ def submit_feedback(rating, comments, history):
         return "Не удалось сохранить отзыв: история сообщений пуста"
     
     try:
-        # Get the last user message and assistant response
-        last_query = history[-2]["content"]  # Second to last is user message
-        last_response = history[-1]["content"]  # Last is assistant response
-        success = rag_assistant.save_feedback(last_query, last_response, rating, comments)
+        # Получаем последние сообщения пользователя и ассистента
+        last_query = history[-2]["content"]  # Предпоследнее - сообщение пользователя
+        last_response = history[-1]["content"]  # Последнее - ответ ассистента
+        
+        # Используем глобальную переменную для получения последнего run_id
+        global LAST_RUN_ID
+        run_id = LAST_RUN_ID
+        
+        if run_id:
+            logger.info(f"Найден run_id для отправки отзыва в LangSmith: {run_id}")
+        else:
+            logger.warning(f"LAST_RUN_ID не установлен, отзыв будет сохранен только локально")
+        
+        # Сохраняем отзыв, передавая run_id для отправки в LangSmith
+        success = rag_assistant.save_feedback(last_query, last_response, rating, comments, run_id)
         
         if success:
+            message = f"Спасибо за вашу оценку: {rating}! Ваш отзыв поможет улучшить систему."
+            if run_id:
+                message += " Отзыв также отправлен в LangSmith."
             logger.info("Отзыв успешно сохранен")
-            return f"Спасибо за вашу оценку: {rating}! Ваш отзыв поможет улучшить систему."
+            return message
         else:
             logger.error("Не удалось сохранить отзыв")
             return "Не удалось сохранить отзыв. Пожалуйста, попробуйте позже."
@@ -987,7 +1066,7 @@ if __name__ == "__main__":
         
         # Запуск интерфейса Gradio
         demo = create_demo(rag_assistant)
-        demo.launch(server_name="0.0.0.0", share=False)
+        demo.launch(server_name="0.0.0.0", share=False, server_port=7862)
     
     except Exception as e:
         logger.error(f"Ошибка при запуске приложения: {str(e)}")

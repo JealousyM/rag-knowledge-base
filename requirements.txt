@@ -38,3 +38,4 @@ gradio
 scikit-learn>=1.0.0
 torch
 transformers
+rank_bm25
