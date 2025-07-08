@@ -1,11 +1,13 @@
 import sys
 import logging
 import json
-import uuid
-import time
 import os
-from typing import List, Dict, Any, Tuple, Optional, Annotated, TypedDict
-
+import time
+from typing import List, Dict, Union, Any, Optional, Tuple, Annotated, TypedDict
+import uuid
+import re
+import numpy as np
+import pandas as pd
 import gradio as gr
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
@@ -315,6 +317,22 @@ class HybridSearch:
 class LangChainAssistant:
     """Класс для работы с LLM моделью через LangChain"""
     
+    # Доступные типы моделей
+    MODEL_TYPE_LOCAL = "local"
+    MODEL_TYPE_OPENAI = "openai"
+    
+    # Доступные модели
+    AVAILABLE_MODELS = {
+        MODEL_TYPE_LOCAL: [
+            "model/T-lite-it-1.0-Q4_K_M-GGUF/t-lite-it-1.0-q4_k_m.gguf"
+        ],
+        MODEL_TYPE_OPENAI: [
+            "gpt-3.5-turbo",
+            "gpt-4",
+            "gpt-4-turbo"
+        ]
+    }
+    
     # Параметры модели по умолчанию
     model_params = {
         "temperature": 0.4,
@@ -326,33 +344,76 @@ class LangChainAssistant:
         "n_gpu_layers": 0
     }
     
-    def __init__(self, model_path: str = "model/T-lite-it-1.0-Q4_K_M-GGUF/t-lite-it-1.0-q4_k_m.gguf"):
-        self.model_path = model_path
+    def __init__(self, model_type: str = MODEL_TYPE_LOCAL, model_name: str = None):
+        # Устанавливаем тип модели (локальная или OpenAI)
+        self.model_type = model_type
+        
+        # Устанавливаем модель по умолчанию для выбранного типа, если не указана
+        if model_name is None:
+            self.model_name = self.AVAILABLE_MODELS[model_type][0]
+        else:
+            self.model_name = model_name
+        
         self.llm = None
         self._load_model()
-        logger.info(f"Инициализирован LangChain ассистент с моделью: {model_path}")
+        logger.info(f"Инициализирован LangChain ассистент с моделью: {self.model_name}, тип: {self.model_type}")
     
     def _load_model(self):
-        """Загружает модель через LangChain LLAMACPP интеграцию"""
+        """Загружает модель через LangChain в зависимости от выбранного типа"""
         try:
-            # Инициализируем модель через LangChain с использованием параметров из model_params
-            self.llm = LlamaCpp(
-                model_path=self.model_path,
-                temperature=self.model_params["temperature"],
-                max_tokens=self.model_params["max_tokens"],
-                top_p=self.model_params["top_p"],
-                stop=["</s>", "<|im_end|>"],
-                verbose=self.model_params["verbose"],
-                n_ctx=self.model_params["n_ctx"],
-                n_threads=self.model_params["n_threads"],
-                n_gpu_layers=self.model_params["n_gpu_layers"]
-            )
-            logger.info("Модель успешно загружена через LangChain")
+            # Загружаем модель в зависимости от ее типа
+            if self.model_type == self.MODEL_TYPE_LOCAL:
+                # Локальная модель LLamaCpp
+                try:
+                    from langchain_community.llms import LlamaCpp
+                    
+                    self.llm = LlamaCpp(
+                        model_path=self.model_name,
+                        temperature=self.model_params["temperature"],
+                        max_tokens=self.model_params["max_tokens"],
+                        top_p=self.model_params["top_p"],
+                        stop=["</s>", "<|im_end|>"],
+                        verbose=self.model_params["verbose"],
+                        n_ctx=self.model_params["n_ctx"],
+                        n_threads=self.model_params["n_threads"],
+                        n_gpu_layers=self.model_params["n_gpu_layers"]
+                    )
+                    logger.info(f"Локальная модель {self.model_name} успешно загружена через LlamaCpp")
+                except Exception as local_err:
+                    logger.error(f"Ошибка при загрузке локальной модели: {str(local_err)}")
+                    raise
+                
+            elif self.model_type == self.MODEL_TYPE_OPENAI:
+                # OpenAI API модель
+                try:
+                    from langchain_openai import ChatOpenAI
+                    
+                    # Проверка, есть ли ключ API
+                    api_key = os.environ.get("OPENAI_API_KEY")
+                    if not api_key:
+                        raise ValueError("Требуется OPENAI_API_KEY в переменных окружения")
+                    
+                    self.llm = ChatOpenAI(
+                        model=self.model_name,
+                        temperature=self.model_params["temperature"],
+                        max_tokens=self.model_params["max_tokens"]
+                        # Примечание: некоторые параметры неприменимы к OpenAI (n_ctx, n_threads, n_gpu_layers)
+                    )
+                    logger.info(f"OpenAI модель {self.model_name} успешно инициализирована")
+                except ImportError:
+                    logger.error("Не удалось импортировать langchain_openai. Установите пакет: pip install langchain-openai")
+                    raise
+                except Exception as openai_err:
+                    logger.error(f"Ошибка при инициализации OpenAI API: {str(openai_err)}")
+                    raise
+            else:
+                raise ValueError(f"Неизвестный тип модели: {self.model_type}")
+                
             logger.info(f"Параметры модели: {self.model_params}")
             
         except Exception as e:
-            logger.error(f"Ошибка при загрузке модели через LangChain: {str(e)}")
-            raise RuntimeError(f"Не удалось загрузить модель: {str(e)}")
+            logger.error(f"Ошибка при загрузке модели: {str(e)}")
+            raise RuntimeError(f"Не удалось загрузить модель {self.model_name} типа {self.model_type}: {str(e)}")
     
     def generate_response(self, messages: List[Dict[str, str]]) -> str:
         """
@@ -388,13 +449,19 @@ class LangChainAssistant:
                     "callbacks": None,
                     "run_name": "generate_response"
                 }
-                generated_text = self.llm.invoke(prompt, config=config)
+                result = self.llm.invoke(prompt, config=config)
+                
+                # Обработка разных форматов возврата (для LlamaCpp и ChatOpenAI)
+                if hasattr(result, 'content'):  # Это AIMessage из ChatOpenAI
+                    generated_text = result.content
+                else:  # Это строка из LlamaCpp
+                    generated_text = result
                 
                 end_time = time.time()
                 logger.info(f"Ответ сгенерирован за {end_time - start_time:.2f} секунд")
-                logger.debug(f"Сгенерированный ответ: {generated_text[:200]}...")  # Логируем начало ответа
+                logger.debug(f"Сгенерированный ответ: {str(generated_text)[:200]}...")  # Логируем начало ответа
                 
-                return generated_text.strip()
+                return generated_text.strip() if isinstance(generated_text, str) else generated_text
             
         except Exception as e:
             logger.error(f"Ошибка при генерации ответа: {str(e)}", exc_info=True)
@@ -422,13 +489,38 @@ class LangChainAssistant:
         """Обновляет параметры модели и перезагружает её
         
         Args:
-            **kwargs: Именованные аргументы с новыми значениями параметров
+            model_type: Тип модели ('local' или 'openai')
+            model_name: Название модели
+            **kwargs: Другие именованные аргументы с новыми значениями параметров
             
         Returns:
             bool: True если модель была успешно перезагружена, False в случае ошибки
         """
         try:
-            # Обновляем параметры
+            # Проверяем наличие указания новой модели
+            model_changed = False
+            
+            # Проверяем тип модели
+            if "model_type" in kwargs and kwargs["model_type"] in [self.MODEL_TYPE_LOCAL, self.MODEL_TYPE_OPENAI]:
+                new_model_type = kwargs.pop("model_type")
+                if new_model_type != self.model_type:
+                    self.model_type = new_model_type
+                    model_changed = True
+                    logger.info(f"Тип модели изменен на: {self.model_type}")
+                    
+            # Проверяем название модели
+            if "model_name" in kwargs:
+                new_model_name = kwargs.pop("model_name")
+                # Проверяем, есть ли такая модель в списке доступных
+                if new_model_name in self.AVAILABLE_MODELS.get(self.model_type, []):
+                    if new_model_name != self.model_name:
+                        self.model_name = new_model_name
+                        model_changed = True
+                        logger.info(f"Название модели изменено на: {self.model_name}")
+                else:
+                    logger.warning(f"Модель {new_model_name} не найдена в списке доступных моделей типа {self.model_type}")
+            
+            # Обновляем другие параметры
             for param, value in kwargs.items():
                 if param in self.model_params:
                     # Преобразуем типы для числовых параметров
@@ -439,13 +531,20 @@ class LangChainAssistant:
                     elif param == "verbose":
                         value = bool(value)
                     
-                    self.model_params[param] = value
+                    if self.model_params[param] != value:
+                        self.model_params[param] = value
+                        model_changed = True
+                        logger.info(f"Параметр {param} изменен на: {value}")
             
-            logger.info(f"Обновление параметров модели: {kwargs}")
-            
-            # Перезагружаем модель с новыми параметрами
-            self._load_model()
-            return True
+            # Перезагружаем модель только если были изменения
+            if model_changed:
+                logger.info(f"Перезагрузка модели с новыми параметрами")
+                self._load_model()
+                return True
+            else:
+                logger.info("Нет изменений в параметрах модели")
+                return True
+                
         except Exception as e:
             logger.error(f"Ошибка при обновлении параметров модели: {str(e)}")
             return False
@@ -777,28 +876,40 @@ def chat_with_feedback(message, history):
         return "", history, "Пожалуйста, введите ваш вопрос."
     
     try:
-        # Convert history to the old format for the assistant
-        old_format_history = []
-        for i in range(0, len(history), 2):
-            if i + 1 < len(history):
-                old_format_history.append([history[i]["content"], history[i+1]["content"]])
+        # Преобразуем историю в формат для ассистента
+        # Ожидаемый формат: [[user_msg1, assistant_msg1], [user_msg2, assistant_msg2], ...]
+        chat_history = []
+        if history:
+            for i, item in enumerate(history):
+                # Если это словари, используем их content
+                if isinstance(item, dict) and "role" in item and "content" in item:
+                    if item["role"] == "user":
+                        # Добавляем только если это пользовательское сообщение
+                        # и следующее сообщение от ассистента
+                        if i + 1 < len(history) and isinstance(history[i+1], dict) and history[i+1]["role"] == "assistant":
+                            chat_history.append([item["content"], history[i+1]["content"]])
+                # Если это кортежи, используем их напрямую
+                elif isinstance(item, tuple) and len(item) == 2:
+                    chat_history.append([item[0], item[1]])
         
-        # Get response, sources and LangSmith run_id
-        response, sources, run_id = rag_assistant.answer_query(message, old_format_history)
+        # Генерируем ответ, используя метод answer_query
+        response, sources, run_id = rag_assistant.answer_query(message, chat_history)
         
-        # Format sources for display
+        # Запоминаем ID запроса для отзывов
+        global LAST_RUN_ID
+        LAST_RUN_ID = run_id
+        
+        # Форматируем источники для отображения
         sources_html = format_source_display(sources)
         
-        # Add user message and assistant response to history
+        # Добавляем вопрос пользователя и ответ ассистента в историю
+        # Используем формат, совместимый с Gradio Chatbot
         history.append({"role": "user", "content": message})
         history.append({"role": "assistant", "content": response})
         
-        # run_id теперь сохраняется в глобальной переменной LAST_RUN_ID
-        logger.debug(f"Запрос пользователя и ответ ассистента добавлены в историю. Текущий LAST_RUN_ID: {LAST_RUN_ID}")
-        
         # Ограничиваем длину истории
         if len(history) > MAX_HISTORY_LENGTH * 2:  # Умножаем на 2, так как каждая пара вопрос-ответ - это 2 элемента
-            removed_count = len(history) - (MAX_HISTORY_LENGTH * 2)
+            removed_count = len(history) - MAX_HISTORY_LENGTH * 2
             history = history[-MAX_HISTORY_LENGTH * 2:]
             logger.debug(f"История чата обрезана. Удалено {removed_count} старых сообщений")
         
@@ -810,6 +921,8 @@ def chat_with_feedback(message, history):
         logger.error(error_msg, exc_info=True)
         history.append({"role": "assistant", "content": "Извините, произошла ошибка при обработке вашего запроса."})
         return "", history, ""
+
+
 
 def format_source_display(sources: List[Dict[str, Any]]) -> str:
     """Форматирует список источников в HTML для отображения
@@ -906,6 +1019,8 @@ def submit_feedback(rating, comments, history):
 
 def create_demo(rag_assistant):
     """Создает демонстрационный интерфейс Gradio"""
+    # Создаем псевдоним для удобства доступа к ассистенту
+    assistant = rag_assistant.assistant
     with gr.Blocks(css="footer {visibility: hidden}") as demo:
         gr.Markdown("# 🔍 Система вопросов и ответов с гибридным поиском")        
         
@@ -946,39 +1061,95 @@ def create_demo(rag_assistant):
                             )
                             feedback_btn = gr.Button("Отправить отзыв")
                             feedback_status = gr.Markdown()
-                
             with gr.TabItem("Настройки модели") as settings_tab:
                 with gr.Group():
-                    gr.Markdown("### Настройки языковой модели")
-                    temperature = gr.Slider(
-                        minimum=0.0, maximum=1.0, step=0.05, value=rag_assistant.assistant.model_params["temperature"],
-                        label="Temperature (влияет на креативность ответов)"
-                    )
-                    max_tokens = gr.Slider(
-                        minimum=128, maximum=2048, step=64, value=rag_assistant.assistant.model_params["max_tokens"],
-                        label="Max Tokens (максимальное количество токенов в ответе)"
-                    )
-                    top_p = gr.Slider(
-                        minimum=0.0, maximum=1.0, step=0.05, value=rag_assistant.assistant.model_params["top_p"],
-                        label="Top P (влияет на распределение вероятностей токенов)"
-                    )
-                    n_ctx = gr.Slider(
-                        minimum=512, maximum=4096, step=512, value=rag_assistant.assistant.model_params["n_ctx"],
-                        label="Контекст (размер контекстного окна)"
-                    )
-                    n_threads = gr.Slider(
-                        minimum=1, maximum=16, step=1, value=rag_assistant.assistant.model_params["n_threads"],
-                        label="Потоки (количество потоков CPU)"
-                    )
-                    n_gpu_layers = gr.Slider(
-                        minimum=0, maximum=32, step=1, value=rag_assistant.assistant.model_params["n_gpu_layers"],
-                        label="GPU слои (количество слоев для GPU)"
-                    )
-                    verbose = gr.Checkbox(
-                        value=rag_assistant.assistant.model_params["verbose"],
-                        label="Подробный режим (verbose)"
+                    gr.Markdown("### Выбор модели")
+                    with gr.Row():
+                        model_type = gr.Dropdown(
+                            choices=["local", "openai"],
+                            value=assistant.model_type,
+                            label="Тип модели",
+                            info="Локальная или OpenAI"
+                        )
+                    
+                    # Создаем обновляемый список моделей
+                    local_models = assistant.AVAILABLE_MODELS[assistant.MODEL_TYPE_LOCAL]
+                    openai_models = assistant.AVAILABLE_MODELS[assistant.MODEL_TYPE_OPENAI]
+                    
+                    # Сначала показываем модели текущего типа
+                    current_models = local_models if assistant.model_type == "local" else openai_models
+                    
+                    model_name = gr.Dropdown(
+                        choices=current_models,
+                        value=assistant.model_name,
+                        label="Модель",
+                        info="Доступные модели выбранного типа"
                     )
                     
+                    # Функция для обновления списка моделей при смене типа
+                    def update_model_list(selected_type):
+                        if selected_type == "local":
+                            return gr.update(choices=local_models, value=local_models[0])
+                        else:
+                            return gr.update(choices=openai_models, value=openai_models[0])
+                    
+                    # Связываем изменение типа модели с обновлением списка моделей
+                    model_type.change(update_model_list, inputs=[model_type], outputs=[model_name])
+                    
+                    gr.Markdown("### Параметры модели")
+                    temperature = gr.Slider(
+                        minimum=0.01,
+                        maximum=1.0,
+                        step=0.01,
+                        value=assistant.model_params["temperature"],
+                        label="Temperature",
+                        info="Чем выше значение, тем более творческие ответы"
+                    )
+                    max_tokens = gr.Slider(
+                        minimum=16,
+                        maximum=4096,
+                        step=16,
+                        value=assistant.model_params["max_tokens"],
+                        label="Max Tokens",
+                        info="Максимальная длина вывода модели"
+                    )
+                    top_p = gr.Slider(
+                        minimum=0.1,
+                        maximum=1.0,
+                        step=0.05,
+                        value=assistant.model_params["top_p"],
+                        label="Top P",
+                        info="Параметр для нуклеусной выборки"
+                    )
+                    n_ctx = gr.Slider(
+                        minimum=512,
+                        maximum=4096,
+                        step=512,
+                        value=assistant.model_params["n_ctx"],
+                        label="Контекст",
+                        info="Размер контекстного окна"
+                    )
+                    n_threads = gr.Slider(
+                        minimum=1,
+                        maximum=12,
+                        step=1,
+                        value=assistant.model_params["n_threads"],
+                        label="Потоки",
+                        info="Количество потоков CPU"
+                    )
+                    n_gpu_layers = gr.Slider(
+                        minimum=0,
+                        maximum=32,
+                        step=1,
+                        value=assistant.model_params["n_gpu_layers"],
+                        label="GPU слои",
+                        info="Количество слоев для GPU"
+                    )
+                    verbose = gr.Checkbox(
+                        value=assistant.model_params["verbose"],
+                        label="Подробный режим",
+                        info="Включает подробный вывод процесса генерации"
+                    )
                     settings_submit_btn = gr.Button("Сохранить настройки", variant="primary")
                     settings_status = gr.Markdown()
 
@@ -987,9 +1158,12 @@ def create_demo(rag_assistant):
             return gr.update(selected="Настройки модели")
         
         # Функция для обновления настроек модели
-        def update_model_settings(temp, max_tok, top_p_val, ctx, threads, gpu_layers, verb):
+        def update_model_settings(model_type_val, model_name_val, temp, max_tok, top_p_val, ctx, threads, gpu_layers, verb):
             try:
-                result = rag_assistant.assistant.update_model_params(
+                # Обновляем настройки модели включая тип и название модели
+                success = rag_assistant.assistant.update_model_params(
+                    model_type=model_type_val,
+                    model_name=model_name_val,
                     temperature=temp,
                     max_tokens=max_tok,
                     top_p=top_p_val,
@@ -998,10 +1172,11 @@ def create_demo(rag_assistant):
                     n_gpu_layers=gpu_layers,
                     verbose=verb
                 )
-                if result:
-                    return "✅ Настройки успешно обновлены"
+                
+                if success:
+                    return "✅ Настройки модели успешно обновлены"
                 else:
-                    return "❌ Ошибка при обновлении настроек"
+                    return "❌ Не удалось обновить настройки модели"
             except Exception as e:
                 return f"❌ Ошибка: {str(e)}"
         
@@ -1045,7 +1220,7 @@ def create_demo(rag_assistant):
         
         settings_submit_btn.click(
             update_model_settings,
-            inputs=[temperature, max_tokens, top_p, n_ctx, n_threads, n_gpu_layers, verbose],
+            inputs=[model_type, model_name, temperature, max_tokens, top_p, n_ctx, n_threads, n_gpu_layers, verbose],
             outputs=[settings_status]
         )
         
@@ -1187,10 +1362,12 @@ if __name__ == "__main__":
         client.get_collection(COLLECTION_NAME)
         logger.info(f"Успешное подключение к коллекции {COLLECTION_NAME}")
         
-        # Создаем экземпляр ассистента
+        # Инициализация RAG-ассистента
         rag_assistant = RAGAssistant()
         
-        # Запуск интерфейса Gradio
+        # Примечание: RAGAssistant сам создает HybridSearch внутри
+        
+        # Создаем экземпляр демонстрации
         demo = create_demo(rag_assistant)
         demo.launch(server_name="0.0.0.0", share=False, server_port=7862)
     
