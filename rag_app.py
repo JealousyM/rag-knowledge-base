@@ -35,6 +35,9 @@ from langsmith import Client, trace
 from prompts import SYSTEM_PROMPT
 from data_processing import RoSBERTaEmbeddings, Config
 
+# Импорт класса для работы с Oracle Text2SQL
+from oracle_text2sql import OracleText2SQL
+
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -45,10 +48,17 @@ load_dotenv()
 # Константы
 COLLECTION_NAME = "documents"
 MAX_CONTEXT_CHUNKS = 8  # Максимальное количество чанков для контекста
+LOADING_WEIGHTS_STR = "⚙️ Загружаю модель... это может занять несколько минут"
 MAX_HISTORY_LENGTH = 10  # Максимальное количество сообщений в истории
 LAST_RUN_ID = None  # Идентификатор последнего запуска в LangSmith для отзывов
 RETRIEVAL_ERROR_MESSAGE = "Извините, эта информация временно недоступна. Уточните детали у менеджера"
 MODEL_PATH = 'model/ru-en-RoSBERTa'
+
+# Глобальный экземпляр Oracle Text2SQL инструмента
+oracle_tool = None
+
+# Индикатор для отслеживания попыток доступа к БД
+DATABASE_KEYWORDS = ['база данных', 'бд', 'запрос', 'sql', 'oracle', 'таблиц', 'запис', 'столбц', 'выбери', 'найди в', 'покажи из']
 
 # Настройка LangSmith трейсинга
 LANGCHAIN_API_KEY = os.environ.get("LANGCHAIN_API_KEY")
@@ -576,6 +586,28 @@ class RAGAssistant:
             self.assistant = LangChainAssistant()
             logger.info("LLM модель успешно загружена")
             
+            # Инициализируем Oracle Text2SQL инструмент, если он еще не инициализирован
+            global oracle_tool
+            if oracle_tool is None:
+                try:
+                    logger.info("Инициализация Oracle Text2SQL инструмента...")
+                    oracle_tool = OracleText2SQL(
+                        model_type="openai",
+                        model_name="gpt-3.5-turbo",
+                        temperature=0.0
+                    )
+                    logger.info("Oracle Text2SQL инструмент создан, попытка подключения к БД...")
+                    connected = oracle_tool.connect()
+                    if connected:
+                        logger.info("Oracle Text2SQL инструмент успешно подключен к БД")
+                    else:
+                        logger.warning("Oracle Text2SQL инструмент создан, но не удалось подключиться к БД")
+                except Exception as db_err:
+                    logger.error(f"Ошибка при инициализации Oracle Text2SQL: {str(db_err)}", exc_info=True)
+            
+            # Сохраняем инструмент для использования в качестве tool агента
+            self.oracle_tool = oracle_tool
+            
             # Создаем LangGraph для процесса RAG
             self.graph = self._create_rag_graph()
             
@@ -734,7 +766,7 @@ class RAGAssistant:
 
     def answer_query(self, query: str, history: List[List[str]]) -> Tuple[str, List[Dict], Optional[str]]:
         """
-        Отвечает на вопрос с использованием LangGraph RAG процесса
+        Отвечает на вопрос с использованием LangGraph RAG процесса или Oracle Text2SQL инструмента
         
         Args:
             query: Текущий запрос пользователя
@@ -743,9 +775,105 @@ class RAGAssistant:
         Returns:
             Кортеж (ответ, список источников, run_id для LangSmith)
         """
+        # Объявляем глобальную переменную в начале функции
+        global LAST_RUN_ID
+        
         try:
             logger.info(f"Обработка запроса: {query}")
             
+            # Проверяем, является ли запрос связанным с БД
+            query_lower = query.lower()
+            is_db_query = False
+            
+            # Проверяем, есть ли явные указания на запрос к БД в текущем запросе
+            if self.oracle_tool and self.oracle_tool.is_connected:
+                # Ключевые слова, которые явно указывают на запрос к БД
+                explicit_db_keywords = [
+                    'таблица', 'таблицы', 'таблицу', 'таблицей',
+                    'база данных', 'базы данных', 'базе данных',
+                    'select', 'insert', 'update', 'delete', 'from', 'where',
+                    'сколько', 'покажи', 'выведи', 'найди', 'найти',
+                    'все записи', 'всех клиентов', 'все заказы',
+                    'количество', 'количества', 'количеству'
+                ]
+                
+                # Проверяем наличие ключевых слов в запросе
+                is_db_query = any(keyword in query_lower for keyword in explicit_db_keywords)
+                
+                # Проверяем наличие шаблонов запросов к БД
+                db_query_patterns = [
+                    'сколько всего',
+                    'количество записей',
+                    'выведи список',
+                    'покажи всех',
+                    'найди всех',
+                    'из таблицы',
+                    'в таблице',
+                    'в бд',
+                    'в базе данных'
+                ]
+                
+                if not is_db_query:
+                    is_db_query = any(pattern in query_lower for pattern in db_query_patterns)
+                
+                # Логируем решение
+                logger.info(f"Определение типа запроса: is_db_query={is_db_query} для запроса: {query}")
+            
+            # Если это запрос к БД и Oracle инструмент доступен и подключен
+            logger.info(f"is_db_query: {is_db_query}, oracle_tool: {self.oracle_tool}, is_connected: {self.oracle_tool.is_connected}")
+            if is_db_query and self.oracle_tool and self.oracle_tool.is_connected:
+                logger.info("Обработка запроса с помощью Oracle Text2SQL")
+                
+                with trace(name="oracle_text2sql_query") as run:
+                    # Получаем информацию о схеме БД
+                    schema_info = self.oracle_tool.get_schema_info()
+                    
+                    # Генерируем SQL запрос
+                    # Пока у нас нет специальных таблиц, используем схему общую
+                    sql_query = self.oracle_tool.generate_sql(query, schema_info)
+                    # Убираем точку с запятой в конце запроса, чтобы избежать ошибки Oracle
+                    sql_query = sql_query.strip()
+                    if sql_query.endswith(';'):
+                        sql_query = sql_query[:-1]
+                    logger.info(f"Сгенерирован SQL запрос: {sql_query}")
+                    
+                    # Выполняем SQL запрос
+                    results, error = self.oracle_tool.execute_sql(sql_query)
+                    
+                    # Форматируем результаты в HTML таблицу
+                    formatted_results = format_results_as_html(results) if results else ""
+                    
+                    # Формируем ответ
+                    answer = f"Я сгенерировал SQL запрос на основе вашего вопроса:\n\n```sql\n{sql_query}\n```\n\n"
+                    
+                    if error:
+                        # Если есть ошибка при выполнении запроса
+                        answer += f"\n**Ошибка при выполнении запроса:**\n\n```\n{error}\n```\n\n"
+                        answer += "\nЯ могу попробовать исправить запрос или предложить альтернативный подход, если вы уточните ваш вопрос."
+                    elif results:
+                        # Добавляем результаты
+                        answer += f"\n**Результаты запроса:**\n\n{formatted_results}"
+                    else:
+                        answer += "\nЗапрос выполнен успешно, но не вернул результатов. Возможно, это был INSERT, UPDATE или DELETE запрос, либо запрос не нашел соответствующих данных."
+                    
+                    # Добавляем источники (таблицы, используемые в запросе)
+                    tables_used = extract_tables_from_sql(sql_query)
+                    sources = [{
+                        'text': f"Таблица: {table}",
+                        'metadata': {'source_type': 'oracle_db', 'table': table},
+                        'source_type': 'oracle_db'
+                    } for table in tables_used]
+                    
+                    # Получаем run_id для LangSmith
+                    if run is not None:
+                        run_id = run.id
+                        # Сохраняем в глобальной переменной
+                        LAST_RUN_ID = run_id
+                        logger.info(f"LangSmith run_id: {run_id} сохранен в LAST_RUN_ID")
+                
+                return answer, sources, run_id
+            
+            # Если это не запрос к БД или Oracle не настроен, используем обычный RAG процесс
             # Создаем начальное состояние для LangGraph
             initial_state = {
                 "question": query,
@@ -777,7 +905,6 @@ class RAGAssistant:
                 if run is not None:
                     run_id = run.id
                     # Сохраняем в глобальной переменной для последующего доступа
-                    global LAST_RUN_ID
                     LAST_RUN_ID = run_id
                     logger.info(f"LangSmith run_id: {run_id} сохранен в LAST_RUN_ID")
             
@@ -967,6 +1094,213 @@ def format_source_display(sources: List[Dict[str, Any]]) -> str:
     html_parts.append("</div>")
     return "\n".join(html_parts)
 
+# Функции для работы с Oracle Text2SQL
+oracle_tool = None
+def extract_tables_from_sql(sql_query: str) -> List[str]:
+    """
+    Извлекает имена таблиц из SQL запроса
+    
+    Args:
+        sql_query: SQL запрос
+        
+    Returns:
+        Список найденных таблиц
+    """
+    # Простая реализация поиска таблиц после FROM и JOIN
+    tables = set()
+    sql_lower = sql_query.lower()
+    
+    # Поиск после FROM
+    from_parts = sql_lower.split(' from ')
+    if len(from_parts) > 1:
+        for i in range(1, len(from_parts)):
+            # Получаем текст после FROM
+            after_from = from_parts[i].strip()
+            # Останавливаемся на первом слове, разделенном пробелами или знаками пунктуации
+            table_name = ''
+            for char in after_from:
+                if char.isalnum() or char == '_' or char == '.':
+                    table_name += char
+                else:
+                    break
+            if table_name:
+                # Убираем имя схемы, если оно есть
+                if '.' in table_name:
+                    table_name = table_name.split('.')[-1]
+                tables.add(table_name)
+    
+    # Поиск после JOIN
+    join_keywords = [' join ', ' inner join ', ' left join ', ' right join ', ' outer join ', ' full join ']
+    for keyword in join_keywords:
+        join_parts = sql_lower.split(keyword)
+        if len(join_parts) > 1:
+            for i in range(1, len(join_parts)):
+                after_join = join_parts[i].strip()
+                table_name = ''
+                for char in after_join:
+                    if char.isalnum() or char == '_' or char == '.':
+                        table_name += char
+                    else:
+                        break
+                if table_name:
+                    if '.' in table_name:
+                        table_name = table_name.split('.')[-1]
+                    tables.add(table_name)
+    
+    return list(tables)
+
+
+def initialize_oracle_tool(model_type: str, model_name: str) -> str:
+    """
+    Инициализирует инструмент Oracle Text2SQL
+    
+    Args:
+        model_type: Тип модели (openai или local)
+        model_name: Название модели
+        
+    Returns:
+        Статус инициализации
+    """
+    global oracle_tool
+    
+    try:
+        # Создаем экземпляр инструмента
+        oracle_tool = OracleText2SQL(
+            model_type=model_type,
+            model_name=model_name,
+            temperature=0.0  # Используем низкую температуру для большей точности SQL
+        )
+        
+        # Проверяем подключение к Oracle
+        if oracle_tool.connect():
+            return "Oracle Text2SQL инструмент успешно инициализирован и подключен к БД"
+        else:
+            return "Ошибка подключения к Oracle. Проверьте параметры подключения в .env файле."
+        
+    except Exception as e:
+        logger.error(f"Ошибка инициализации Oracle Text2SQL: {str(e)}")
+        return f"Ошибка: {str(e)}"
+
+
+def get_schema_info(tables_str=None):
+    """
+    Получает информацию о схеме базы данных
+    
+    Args:
+        tables_str: Список таблиц через запятую (опционально)
+    
+    Returns:
+        Текст со схемой БД
+    """
+    global oracle_tool
+    
+    if not oracle_tool:
+        return "Ошибка: Oracle Text2SQL не инициализирован. Нажмите 'Инициализировать Oracle'."
+    
+    try:
+        # Парсим таблицы из строки, если указаны
+        tables = None
+        if tables_str and tables_str.strip():
+            tables = [t.strip() for t in tables_str.split(',') if t.strip()]
+        
+        # Получаем информацию о схеме
+        schema_info = oracle_tool.get_schema_info(tables=tables)
+        return schema_info
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении схемы: {str(e)}")
+        return f"Ошибка: {str(e)}"
+
+
+def process_text2sql_query(text_query, tables_str=None, execute=True):
+    """
+    Обрабатывает текстовый запрос к БД, преобразуя его в SQL и выполняя
+    
+    Args:
+        text_query: Запрос на естественном языке
+        tables_str: Список таблиц через запятую (опционально)
+        execute: Выполнять ли сгенерированный SQL запрос
+    
+    Returns:
+        Три значения: SQL запрос, результаты в виде HTML таблицы и сообщение о статусе
+    """
+    global oracle_tool
+    
+    if not oracle_tool:
+        return "", "", "Ошибка: Oracle Text2SQL не инициализирован. Нажмите 'Инициализировать Oracle'."
+    
+    if not text_query or text_query.strip() == "":
+        return "", "", "Пожалуйста, введите запрос на естественном языке."
+    
+    try:
+        # Парсим таблицы из строки, если указаны
+        tables = None
+        if tables_str and tables_str.strip():
+            tables = [t.strip() for t in tables_str.split(',') if t.strip()]
+        
+        # Обрабатываем запрос
+        result = oracle_tool.process_text_query(
+            text_query=text_query,
+            tables=tables,
+            execute=execute
+        )
+        
+        # Форматируем результаты в виде HTML таблицы
+        sql_query = result["sql"]
+        results_html = format_results_as_html(result["results"]) if execute else ""
+        
+        # Формируем сообщение о статусе
+        if result["error"]:
+            status_msg = f"Ошибка: {result['error']}"
+        else:
+            count = len(result["results"]) if execute else 0
+            status_msg = f"SQL запрос успешно сгенерирован" + (f" и выполнен. Получено {count} результатов." if execute else ".")
+        
+        return sql_query, results_html, status_msg
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке Text2SQL запроса: {str(e)}")
+        return "", "", f"Ошибка: {str(e)}"
+
+
+def format_results_as_html(results):
+    """
+    Форматирует результаты запроса в HTML таблицу
+    
+    Args:
+        results: Результаты запроса в виде списка словарей
+        
+    Returns:
+        HTML код таблицы с результатами
+    """
+    if not results or not isinstance(results, list) or not results:
+        return "<div>Нет результатов</div>"
+    
+    # Проверяем, что первый элемент списка - словарь
+    if not results or not isinstance(results[0], dict):
+        return "<div>Результаты в неожиданном формате</div>"
+    
+    html = ["<div style='overflow-x:auto;'><table style='width:100%; border-collapse:collapse;'>"]
+    
+    # Заголовок таблицы
+    columns = list(results[0].keys())
+    html.append("<thead><tr>")
+    for col in columns:
+        html.append(f"<th style='border:1px solid #ddd; padding:8px; text-align:left; background-color:#f2f2f2;'>{col}</th>")
+    html.append("</tr></thead>")
+    
+    # Данные таблицы
+    html.append("<tbody>")
+    for row in results:
+        html.append("<tr>")
+        for col in columns:
+            html.append(f"<td style='border:1px solid #ddd; padding:8px;'>{str(row.get(col, ''))}</td>")
+        html.append("</tr>")
+    html.append("</tbody></table></div>")
+    
+    return "".join(html)
+
+
 def clear_chat():
     """Очищает историю чата и возвращает пустые значения для всех элементов"""
     logger.info("Очистка истории чата")
@@ -1061,6 +1395,8 @@ def create_demo(rag_assistant):
                             )
                             feedback_btn = gr.Button("Отправить отзыв")
                             feedback_status = gr.Markdown()
+            # Добавляем вкладку "Настройки модели"
+            
             with gr.TabItem("Настройки модели") as settings_tab:
                 with gr.Group():
                     gr.Markdown("### Выбор модели")
@@ -1207,22 +1543,15 @@ def create_demo(rag_assistant):
             inputs=[rating, comments, chatbot],
             outputs=[feedback_status]
         )
-        
-        # Добавляем кнопку перехода к настройкам в нижней части интерфейса
-        with gr.Row():
-            settings_btn = gr.Button("⚙️ Настройки модели")
-            
-        # Обработчики для настроек модели
-        settings_btn.click(
-            select_tab_settings,
-            outputs=[tabs]
-        )
-        
+                    
         settings_submit_btn.click(
             update_model_settings,
             inputs=[model_type, model_name, temperature, max_tokens, top_p, n_ctx, n_threads, n_gpu_layers, verbose],
             outputs=[settings_status]
         )
+        
+        # Инициализируем Oracle Text2SQL при запуске приложения 
+        # для использования в качестве инструмента агента
         
     return demo
 
