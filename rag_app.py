@@ -18,11 +18,17 @@ from langchain_community.llms import LlamaCpp
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Qdrant
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
-from langchain.schema.runnable import RunnableConfig, RunnableLambda
+from langchain.schema import Document, AIMessage
+from langchain.schema.runnable import RunnableConfig, RunnableLambda, RunnablePassthrough
 from langchain.schema.output_parser import StrOutputParser
-from langchain.prompts import ChatPromptTemplate
+from langchain.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate
 from langchain.retrievers import BM25Retriever, EnsembleRetriever
+from langchain.agents import AgentType, initialize_agent, create_react_agent, AgentExecutor
+from langchain.agents.format_scratchpad import format_to_openai_function_messages, format_to_openai_functions
+from langchain.output_parsers.openai_functions import JsonOutputFunctionsParser
+from langchain_openai import ChatOpenAI
+from langchain.tools import BaseTool, StructuredTool, tool
+from langchain.tools.convert_to_openai import format_tool_to_openai_function
 
 # LangGraph imports
 from langgraph.graph import END, StateGraph
@@ -37,6 +43,7 @@ from data_processing import RoSBERTaEmbeddings, Config
 
 # Импорт класса для работы с Oracle Text2SQL
 from oracle_text2sql import OracleText2SQL
+from sql_tool import set_oracle_tool, get_oracle_tool
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -54,8 +61,7 @@ LAST_RUN_ID = None  # Идентификатор последнего запус
 RETRIEVAL_ERROR_MESSAGE = "Извините, эта информация временно недоступна. Уточните детали у менеджера"
 MODEL_PATH = 'model/ru-en-RoSBERTa'
 
-# Глобальный экземпляр Oracle Text2SQL инструмента
-oracle_tool = None
+# Для управления инструментом Oracle Text2SQL используется модуль sql_tool
 
 # Индикатор для отслеживания попыток доступа к БД
 DATABASE_KEYWORDS = ['база данных', 'бд', 'запрос', 'sql', 'oracle', 'таблиц', 'запис', 'столбц', 'выбери', 'найди в', 'покажи из']
@@ -225,13 +231,23 @@ class HybridSearch:
             # Используем trace внутри функции вместо декоратора
             with trace(name="search"):
                 try:
-                    results = self.ensemble_retriever.get_relevant_documents(query)
+                    results = self.ensemble_retriever.invoke(query)
                     logger.info(f"Получено {len(results)} документов через ретривер")
                     
                     # Проверка и отладка - показываем первый документ, если есть
                     if results and len(results) > 0:
                         first_doc = results[0]
-                        logger.info(f"Первый результат: \nсодержимое: '{first_doc.page_content[:100]}...'\nметаданные: {first_doc.metadata}")
+                        # Адаптация к новой структуре документов
+                        if hasattr(first_doc, 'page_content'):
+                            content = first_doc.page_content
+                            metadata = first_doc.metadata if hasattr(first_doc, 'metadata') else {}
+                        elif hasattr(first_doc, 'text'):
+                            content = first_doc.text
+                            metadata = first_doc.metadata if hasattr(first_doc, 'metadata') else {}
+                        else:
+                            content = str(first_doc)
+                            metadata = getattr(first_doc, 'metadata', {})
+                        logger.info(f"Первый результат: \nсодержимое: '{content[:100]}...'\nметаданные: {metadata}")
                 except Exception as search_error:
                     logger.error(f"Ошибка при поиске: {str(search_error)}")
                     
@@ -328,19 +344,19 @@ class LangChainAssistant:
     """Класс для работы с LLM моделью через LangChain"""
     
     # Доступные типы моделей
-    MODEL_TYPE_LOCAL = "local"
     MODEL_TYPE_OPENAI = "openai"
+    MODEL_TYPE_LOCAL = "local"
     
     # Доступные модели
     AVAILABLE_MODELS = {
-        MODEL_TYPE_LOCAL: [
-            "model/T-lite-it-1.0-Q4_K_M-GGUF/t-lite-it-1.0-q4_k_m.gguf"
-        ],
         MODEL_TYPE_OPENAI: [
             "gpt-3.5-turbo",
             "gpt-4",
             "gpt-4-turbo"
-        ]
+        ],
+        MODEL_TYPE_LOCAL: [
+            "model/T-lite-it-1.0-Q4_K_M-GGUF/t-lite-it-1.0-q4_k_m.gguf"
+        ],
     }
     
     # Параметры модели по умолчанию
@@ -354,15 +370,12 @@ class LangChainAssistant:
         "n_gpu_layers": 0
     }
     
-    def __init__(self, model_type: str = MODEL_TYPE_LOCAL, model_name: str = None):
+    def __init__(self, model_type: str = MODEL_TYPE_OPENAI, model_name: str = "gpt-3.5-turbo"):
         # Устанавливаем тип модели (локальная или OpenAI)
         self.model_type = model_type
         
-        # Устанавливаем модель по умолчанию для выбранного типа, если не указана
-        if model_name is None:
-            self.model_name = self.AVAILABLE_MODELS[model_type][0]
-        else:
-            self.model_name = model_name
+        # По умолчанию теперь используется OpenAI gpt-3.5-turbo
+        self.model_name = model_name
         
         self.llm = None
         self._load_model()
@@ -575,47 +588,601 @@ class RAGAssistant:
     Интегрирует гибридный поиск и LLM для ответов на вопросы
     """
     
-    def __init__(self):
-        logger.info("Инициализация RAGAssistant с LangGraph...")
+    def __init__(self, load_model=True):
+        logger.info("Инициализация RAGAssistant с ReAct агентами...")
+        self.assistant = None
+        self.llm = None
+        self.oracle_tool = None
+        self.tools = []
+        self.graph = None
+        self.router_chain = None
+        self.sql_agent_executor = None
+        self.rag_agent_executor = None
+        self.general_agent_executor = None
+        self.supports_functions = False
+        self.feedback_data = []
+        
         try:
-            # Инициализируем компоненты
+            # Инициализируем компоненты для поиска
             self.search_engine = HybridSearch()
-            logger.info("Инициализирован поисковый движок LangChain")
+            logger.info("Инициализирован поисковый движок для RAG")
             
-            logger.info("Загрузка LLM модели через LangChain...")
+            # Загружаем основную LLM модель
+            logger.info("Загрузка LLM модели...")
             self.assistant = LangChainAssistant()
-            logger.info("LLM модель успешно загружена")
+            self.llm = self.assistant.llm  # получаем ChatOpenAI или LlamaCpp
+            model_class_name = type(self.llm).__name__
+            logger.info(f"LLM успешно загружен: {model_class_name}")
             
-            # Инициализируем Oracle Text2SQL инструмент, если он еще не инициализирован
-            global oracle_tool
-            if oracle_tool is None:
-                try:
-                    logger.info("Инициализация Oracle Text2SQL инструмента...")
-                    oracle_tool = OracleText2SQL(
-                        model_type="openai",
-                        model_name="gpt-3.5-turbo",
-                        temperature=0.0
-                    )
-                    logger.info("Oracle Text2SQL инструмент создан, попытка подключения к БД...")
-                    connected = oracle_tool.connect()
-                    if connected:
-                        logger.info("Oracle Text2SQL инструмент успешно подключен к БД")
-                    else:
-                        logger.warning("Oracle Text2SQL инструмент создан, но не удалось подключиться к БД")
-                except Exception as db_err:
-                    logger.error(f"Ошибка при инициализации Oracle Text2SQL: {str(db_err)}", exc_info=True)
+            # Определяем, поддерживает ли модель function calling
+            is_openai_model = model_class_name == 'ChatOpenAI'
+            logger.info(f"Поддержка OpenAI function calling: {is_openai_model}")
+            self.supports_functions = is_openai_model
             
-            # Сохраняем инструмент для использования в качестве tool агента
-            self.oracle_tool = oracle_tool
+            # Проверяем настройки модели OpenAI
+            if is_openai_model:
+                model_name = getattr(self.llm, 'model_name', 'gpt-3.5-turbo')
+                logger.info(f"Используется OpenAI модель: {model_name}")
+            
+            # Инициализируем Oracle Text2SQL с основной моделью LLM
+            logger.info("Инициализация Oracle Text2SQL...")
+            try:
+                # Создаем инструмент Oracle с нашей основной моделью LLM
+                oracle_tool_instance = OracleText2SQL(
+                    llm=self.llm,  # Передаем существующую модель
+                    temperature=0.0
+                )
+                logger.info("Oracle Text2SQL инструмент создан, подключение к БД...")
+                connected = oracle_tool_instance.connect()
+                if connected:
+                    logger.info("Oracle Text2SQL успешно подключен к БД")
+                    # Регистрируем инструмент в модуле sql_tool
+                    set_oracle_tool(oracle_tool_instance)
+                else:
+                    logger.warning("Oracle Text2SQL создан, но не удалось подключиться к БД")
+            except Exception as db_err:
+                logger.error(f"Ошибка при инициализации Oracle Text2SQL: {str(db_err)}", exc_info=True)
+                oracle_tool_instance = None
+            
+            # Сохраняем инструмент
+            self.oracle_tool = oracle_tool_instance
+            
+            # Создаем инструменты для агентов
+            self.tools = self._create_tools()
+            logger.info(f"Создано {len(self.tools)} инструментов для агентов")
+            
+            # Инициализируем роутер и ReAct агентов
+            self._initialize_agents()
             
             # Создаем LangGraph для процесса RAG
             self.graph = self._create_rag_graph()
             
             self.feedback_data = []  # Для хранения обратной связи
-            logger.info("RAGAssistant успешно инициализирован с LangChain и LangGraph")
+            logger.info("RAGAssistant успешно инициализирован с ReAct агентами")
+            
         except Exception as e:
             logger.error(f"Ошибка при инициализации RAGAssistant: {str(e)}", exc_info=True)
             raise
+            
+    def _convert_tools_to_openai_functions(self, tools):
+        """Преобразует инструменты в формат функций OpenAI"""
+        from langchain.tools.convert_to_openai import convert_to_openai_function
+        return [format_tool_to_openai_function(tool) for tool in tools]
+        
+    def _create_tools(self):
+        """Создает инструменты для использования в ReAct агентах"""
+        tools = []
+        
+        # Создаем инструмент для запросов к базе данных
+        if self.oracle_tool:
+            @tool
+            def database_tool(question: str) -> str:
+                """Выполняет запросы к базе данных Oracle. Используй этот инструмент, когда вопрос касается 
+                базы данных, требует доступа к хранимым данным, или когда упоминаются таблицы, записи, SQL или коды из систем учета."""
+                logger.info(f"Вызов инструмента database_tool с вопросом: {question}")
+                try:
+                    # Используем блок with trace вместо декоратора @trace
+                    with trace("database_tool_execution"):
+                        oracle_instance = get_oracle_tool()
+                        if not oracle_instance:
+                            return "Oracle Text2SQL не инициализирован, не могу выполнить запрос к БД."
+                        
+                        schema_info = oracle_instance.get_schema_info()
+                        sql_query = oracle_instance.generate_sql(question, schema_info)
+                        sql_query = sql_query.strip().rstrip(";")  # убираем ; в конце
+                        logger.info(f"Сгенерирован SQL запрос: {sql_query}")
+                        
+                        rows, error = oracle_instance.execute_sql(sql_query)
+                        if error:
+                            return f"Ошибка при выполнении запроса к БД: {error}"
+                        
+                        # Форматируем ответ в читаемом виде
+                        result_text = f"SQL запрос: ```sql\n{sql_query}\n```\n\n"
+                        if not rows:
+                            return result_text + "Запрос выполнен успешно, но данные не найдены."
+                        
+                        # Добавляем таблицу с результатами
+                        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                            result_text += "Результаты:\n\n"
+                            # Формируем таблицу в markdown
+                            headers = rows[0].keys()
+                            result_text += "| " + " | ".join(headers) + " |\n"
+                            result_text += "| " + " | ".join(["---" for _ in headers]) + " |\n"
+                            
+                            # Добавляем строки
+                            for row in rows[:20]:  # ограничиваем вывод
+                                result_text += "| " + " | ".join([str(row.get(h, "")) for h in headers]) + " |\n"
+                            
+                            if len(rows) > 20:
+                                result_text += f"\n*Показано 20 записей из {len(rows)}*\n"
+                        else:
+                            result_text += f"Результат: {rows}"
+                        
+                        return result_text
+                except Exception as ex:
+                    logger.error(f"Ошибка в database_tool: {str(ex)}", exc_info=True)
+                    return f"Произошла ошибка при обработке запроса к БД: {str(ex)}"
+            
+            tools.append(database_tool)
+            logger.info("Инструмент database_tool создан и добавлен")
+        
+        # Создаем инструмент для RAG поиска по документам
+        @tool
+        def rag_tool(question: str) -> str:
+            """Ищет информацию в документах и возвращает релевантные фрагменты. Используй этот инструмент, когда 
+            вопрос касается общих знаний, определений, процессов или политик, описанных в документах."""
+            logger.info(f"Вызов инструмента rag_tool с вопросом: {question}")
+            try:
+                # Используем блок with trace вместо декоратора @trace
+                with trace("rag_search"):
+                    # Получаем документы через поисковый движок
+                    docs = self.search_engine.search(question)
+                    if not docs:
+                        return "Не найдено релевантной информации в документах."
+                    
+                    # Детальная отладка первого документа для понимания структуры ScoredPoint
+                    if docs and len(docs) > 0:
+                        first_doc = docs[0]
+                        logger.info(f"DEBUG: Тип первого документа: {type(first_doc)}")
+                        logger.info(f"DEBUG: Все атрибуты: {dir(first_doc)}")
+                        
+                        # Попробуем получить все возможные атрибуты
+                        try_attributes = ['page_content', 'text', 'content', 'payload', 'metadata', 'id', 'score', 'vector']
+                        for attr in try_attributes:
+                            if hasattr(first_doc, attr):
+                                try:
+                                    value = getattr(first_doc, attr)
+                                    if attr == 'vector' and value is not None:
+                                        logger.info(f"DEBUG: {attr} = [vector с длиной {len(value)}]")
+                                    else:
+                                        logger.info(f"DEBUG: {attr} = {value}")
+                                except Exception as e:
+                                    logger.info(f"DEBUG: Ошибка при получении {attr}: {str(e)}")
+                    
+                    # Форматируем результаты поиска
+                    context_text = "Найденная информация из документов:\n\n"
+                    for i, doc in enumerate(docs[:5], 1):
+                        try:
+                            # Обработка ScoredPoint объектов на основе отладочных данных
+                            # ScoredPoint объекты должны иметь поле payload с текстовым содержимым
+                            if hasattr(doc, 'payload') and isinstance(doc.payload, dict):
+                                # В Qdrant содержимое обычно хранится в payload под ключами page_content или text
+                                if 'page_content' in doc.payload:
+                                    content = doc.payload['page_content']
+                                elif 'text' in doc.payload:
+                                    content = doc.payload['text']
+                                elif 'content' in doc.payload:
+                                    content = doc.payload['content']
+                                elif '_content' in doc.payload:
+                                    content = doc.payload['_content']
+                                else:
+                                    # Если нет стандартных ключей, ищем первое текстовое поле
+                                    text_field = None
+                                    for key, value in doc.payload.items():
+                                        if isinstance(value, str) and len(value) > 50:  # Достаточно длинное поле скорее всего содержит текст
+                                            text_field = value
+                                            break
+                                    if text_field:
+                                        content = text_field
+                                    else:
+                                        # Если нет длинных текстовых полей, возвращаем весь payload
+                                        content = str(doc.payload)
+                            # Обработка стандартных документов LangChain
+                            elif hasattr(doc, 'page_content'):
+                                content = doc.page_content
+                            elif hasattr(doc, 'text'):
+                                content = doc.text
+                            elif hasattr(doc, 'content'):
+                                content = doc.content
+                            else:
+                                # Последняя попытка - пробуем сериализовать документ целиком
+                                try:
+                                    import json
+                                    if hasattr(doc, '__dict__'):
+                                        content = json.dumps(doc.__dict__, default=str)
+                                    elif hasattr(doc, 'to_dict'):
+                                        content = json.dumps(doc.to_dict(), default=str)
+                                    else:
+                                        content = f"[Не удалось извлечь содержимое из {type(doc).__name__}]"
+                                except:
+                                    content = f"[Не удалось извлечь содержимое из {type(doc).__name__}]"
+                                    
+                        except Exception as e:
+                            logger.error(f"Ошибка при извлечении содержимого документа: {str(e)}")
+                            content = f"[Ошибка при извлечении текста: {str(e)}]"
+                            
+                        context_text += f"**Источник {i}**\n{content}\n\n"
+                    
+                    return context_text
+            except Exception as ex:
+                logger.error(f"Ошибка в rag_tool: {str(ex)}", exc_info=True)
+                return f"Произошла ошибка при поиске в документах: {str(ex)}"
+        
+        tools.append(rag_tool)
+        logger.info("Инструмент rag_tool создан и добавлен")
+        
+        # Инструмент для прямых ответов без использования внешних источников
+        @tool
+        def direct_answer(question: str) -> str:
+            """Отвечает на вопросы напрямую без поиска в документах или БД. Используй этот инструмент для простых 
+            вопросов, приветствий, или когда нужны только логические рассуждения/вычисления."""
+            logger.info(f"Вызов инструмента direct_answer с вопросом: {question}")
+            # Этот инструмент просто сигнализирует роутеру, что нужно отвечать напрямую
+            return "Отвечу на этот вопрос напрямую, используя общие знания, логику или математические вычисления."
+        
+        tools.append(direct_answer)
+        logger.info("Инструмент direct_answer создан и добавлен")
+        
+        return tools
+    
+    def _initialize_agents(self):
+        """Инициализирует роутер и специализированные ReAct агенты"""
+        try:
+            logger.info("Инициализация агентов...")
+            
+            # 1. Создаем роутер-агент для определения типа запроса
+            if self.supports_functions:
+                logger.info("Создание роутера с поддержкой function-calling")
+                # Используем OPENAI_FUNCTIONS формат для роутера
+                from langchain.agents.output_parsers import OpenAIFunctionsAgentOutputParser
+                from langchain.output_parsers.openai_functions import JsonOutputFunctionsParser
+                from prompts import ROUTER_AGENT_PROMPT
+                # Создаем промпт для роутера
+                router_prompt = ChatPromptTemplate.from_messages([
+                    ("system", ROUTER_AGENT_PROMPT),
+                    ("human", "{question}"),
+                    ("ai", "{agent_scratchpad}")
+                ])
+                
+                # Определяем функции для роутера
+                router_functions = [
+                    {
+                        "name": "route_query",
+                        "description": "Маршрутизирует запрос к наиболее подходящему инструменту",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "route": {
+                                    "type": "string",
+                                    "enum": ["database", "documents", "direct"],
+                                    "description": "Выбранный маршрут для запроса"
+                                },
+                                "reasoning": {
+                                    "type": "string",
+                                    "description": "Объяснение, почему был выбран этот маршрут"
+                                }
+                            },
+                            "required": ["route", "reasoning"]
+                        }
+                    }
+                ]
+                
+                # Создаем цепочку роутера с парсером JSON вывода
+                self.llm_with_routing = self.llm.bind(functions=router_functions)
+                self.router_chain = (
+                    {"question": RunnablePassthrough(), "agent_scratchpad": lambda x: ""} 
+                    | router_prompt 
+                    | self.llm_with_routing 
+                    | JsonOutputFunctionsParser()
+                )
+                
+                logger.info("Роутер с function-calling создан")
+                
+                # 2. Создаем SQL ReAct агент
+                if self.supports_functions and self.oracle_tool:
+                    logger.info("Создание SQL ReAct агента с function-calling")
+                    from prompts import SQL_AGENT_PROMPT
+                    # Создаем промпт для SQL агента
+                    sql_prompt = ChatPromptTemplate.from_messages([
+                        ("system", SQL_AGENT_PROMPT),
+                        ("human", "{input}"),
+                        ("ai", "{agent_scratchpad}")
+                    ])
+                    
+                    # Определяем инструменты для SQL агента
+                    sql_tools = [tool for tool in self.tools if tool.name == "database_tool"]
+                    
+                    # Форматируем скретчпад (мыслительный процесс) агента
+                    def _format_sql_scratchpad(steps):
+                        return format_to_openai_function_messages(steps)
+                    
+                    # Создаем и собираем агента
+                    sql_agent = (
+                        {
+                            "input": lambda x: x["input"],
+                            "agent_scratchpad": lambda x: _format_sql_scratchpad(x["intermediate_steps"]),
+                            "tools": lambda x: sql_tools
+                        }
+                        | sql_prompt
+                        | self.llm.bind(functions=[format_tool_to_openai_function(tool) for tool in sql_tools])
+                        | OpenAIFunctionsAgentOutputParser()
+                    )
+                    
+                    # Создаем исполнитель агента
+                    self.sql_agent_executor = AgentExecutor(agent=sql_agent, tools=sql_tools, verbose=True)
+                    logger.info("SQL ReAct агент успешно создан")
+                else:
+                    self.sql_agent_executor = None
+                    logger.info("SQL ReAct агент не создан (нет Oracle)")
+                
+                # 3. Создаем RAG ReAct агент для поиска в документах
+                if self.supports_functions:
+                    logger.info("Создание RAG ReAct агента с function-calling")
+                    from prompts import GENERAL_AGENT_PROMPT
+                    # Создаем промпт для RAG агента
+                    rag_prompt = ChatPromptTemplate.from_messages([
+                        ("system", GENERAL_AGENT_PROMPT),
+                        ("human", "{input}"),
+                        ("ai", "{agent_scratchpad}")
+                    ])
+                    
+                    # Определяем инструменты для RAG агента
+                    rag_tools = [tool for tool in self.tools if tool.name == "rag_tool"]
+                    
+                    # Форматируем скретчпад агента
+                    def _format_rag_scratchpad(steps):
+                        return format_to_openai_function_messages(steps)
+                    
+                    # Создаем и собираем агента
+                    rag_agent = (
+                        {
+                            "input": lambda x: x["input"],
+                            "agent_scratchpad": lambda x: _format_rag_scratchpad(x["intermediate_steps"]),
+                            "tools": lambda x: rag_tools
+                        }
+                        | rag_prompt
+                        | self.llm.bind(functions=[format_tool_to_openai_function(tool) for tool in rag_tools])
+                        | OpenAIFunctionsAgentOutputParser()
+                    )
+                    
+                    # Создаем исполнитель агента
+                    self.rag_agent_executor = AgentExecutor(agent=rag_agent, tools=rag_tools, verbose=True)
+                    logger.info("RAG ReAct агент успешно создан")
+                else:
+                    self.rag_agent_executor = None
+                    logger.info("RAG ReAct агент не создан (нет поддержки function-calling)")
+                
+                # 4. Создаем общий агент для прямых ответов
+                if self.supports_functions:
+                    logger.info("Создание общего ReAct агента с function-calling")
+                    from prompts import GENERAL_AGENT_PROMPT
+                    # Создаем промпт для общего агента
+                    general_prompt = ChatPromptTemplate.from_messages([
+                        ("system", GENERAL_AGENT_PROMPT),
+                        ("human", "{input}"),
+                        ("ai", "{agent_scratchpad}")
+                    ])
+                    
+                    # Определяем инструменты для общего агента (все инструменты)
+                    general_tools = self.tools
+                    
+                    # Форматируем скретчпад агента
+                    def _format_general_scratchpad(steps):
+                        return format_to_openai_function_messages(steps)
+                    
+                    # Создаем и собираем агента
+                    general_agent = (
+                        {
+                            "input": lambda x: x["input"],
+                            "agent_scratchpad": lambda x: _format_general_scratchpad(x["intermediate_steps"]),
+                            "tools": lambda x: general_tools
+                        }
+                        | general_prompt
+                        | self.llm.bind(functions=[format_tool_to_openai_function(tool) for tool in general_tools])
+                        | OpenAIFunctionsAgentOutputParser()
+                    )
+                    
+                    # Создаем исполнитель агента
+                    self.general_agent_executor = AgentExecutor(agent=general_agent, tools=general_tools, verbose=True)
+                    logger.info("Общий ReAct агент успешно создан")
+                else:
+                    # Для моделей без поддержки функций используем fallback на LangGraph
+                    self.general_agent_executor = None
+                    logger.info("Общий ReAct агент не создан (нет поддержки function-calling)")
+                
+                # Определяем инструменты для RAG агента
+                rag_tools = [tool for tool in self.tools if tool.name == "rag_tool"]
+                
+                # Форматируем скретчпад агента
+                def _format_rag_scratchpad(steps):
+                    return format_to_openai_function_messages(steps)
+                
+                # Создаем и собираем агента
+                rag_agent = (
+                    {
+                        "input": lambda x: x["input"],
+                        "agent_scratchpad": lambda x: _format_rag_scratchpad(x["intermediate_steps"]),
+                        "tools": lambda x: rag_tools
+                    }
+                    | rag_prompt
+                    | self.llm.bind(functions=[format_tool_to_openai_function(tool) for tool in rag_tools])
+                    | OpenAIFunctionsAgentOutputParser()
+                )
+                
+                # Создаем исполнитель агента
+                self.rag_agent_executor = AgentExecutor(agent=rag_agent, tools=rag_tools, verbose=True)
+                logger.info("RAG ReAct агент успешно создан")
+            else:
+                self.rag_agent_executor = None
+                logger.info("RAG ReAct агент не создан (нет поддержки function-calling)")
+            
+            # 4. Создаем общий агент для прямых ответов
+            if self.supports_functions:
+                logger.info("Создание общего ReAct агента с function-calling")
+                from prompts import GENERAL_AGENT_PROMPT
+                # Создаем промпт для общего агента
+                general_prompt = ChatPromptTemplate.from_messages([
+                    ("system", GENERAL_AGENT_PROMPT),
+                    ("human", "{input}"),
+                    ("ai", "{agent_scratchpad}")
+                ])
+                
+                # Определяем инструменты для общего агента (все инструменты)
+                general_tools = self.tools
+                
+                # Форматируем скретчпад агента
+                def _format_general_scratchpad(steps):
+                    return format_to_openai_function_messages(steps)
+                
+                # Создаем и собираем агента
+                general_agent = (
+                    {
+                        "input": lambda x: x["input"],
+                        "agent_scratchpad": lambda x: _format_general_scratchpad(x["intermediate_steps"]),
+                        "tools": lambda x: general_tools
+                    }
+                    | general_prompt
+                    | self.llm.bind(functions=[format_tool_to_openai_function(tool) for tool in general_tools])
+                    | OpenAIFunctionsAgentOutputParser()
+                )
+                
+                # Создаем исполнитель агента
+                self.general_agent_executor = AgentExecutor(agent=general_agent, tools=general_tools, verbose=True)
+                logger.info("Общий ReAct агент успешно создан")
+            else:
+                # Для моделей без поддержки функций используем fallback на LangGraph
+                self.general_agent_executor = None
+                logger.info("Общий ReAct агент не создан (нет поддержки function-calling)")
+            
+            logger.info("Роутер без function-calling создан")
+        
+            # 2. Создаем SQL ReAct агент
+            if self.supports_functions and self.oracle_tool:
+                logger.info("Создание SQL ReAct агента с function-calling")
+                from prompts import SQL_AGENT_PROMPT
+                # Создаем промпт для SQL агента
+                sql_prompt = ChatPromptTemplate.from_messages([
+                    ("system", SQL_AGENT_PROMPT),
+                    ("human", "{input}"),
+                    ("ai", "{agent_scratchpad}")
+                ])
+                
+                # Определяем инструменты для SQL агента
+                sql_tools = [tool for tool in self.tools if tool.name == "database_tool"]
+                
+                # Форматируем скретчпад (мыслительный процесс) агента
+                def _format_sql_scratchpad(steps):
+                    return format_to_openai_function_messages(steps)
+                
+                # Создаем и собираем агента
+                sql_agent = (
+                    {
+                        "input": lambda x: x["input"],
+                        "agent_scratchpad": lambda x: _format_sql_scratchpad(x["intermediate_steps"]),
+                        "tools": lambda x: sql_tools
+                    }
+                    | sql_prompt
+                    | self.llm.bind(functions=[format_tool_to_openai_function(tool) for tool in sql_tools])
+                    | OpenAIFunctionsAgentOutputParser()
+                )
+                
+                # Создаем исполнитель агента
+                self.sql_agent_executor = AgentExecutor(agent=sql_agent, tools=sql_tools, verbose=True)
+                logger.info("SQL ReAct агент успешно создан")
+            else:
+                self.sql_agent_executor = None
+                logger.info("SQL ReAct агент не создан (нет поддержки function-calling или Oracle)")
+            
+            # 3. Создаем RAG ReAct агент для поиска в документах
+            if self.supports_functions:
+                logger.info("Создание RAG ReAct агента с function-calling")
+                from prompts import GENERAL_AGENT_PROMPT                
+                # Создаем промпт для RAG агента
+                rag_prompt = ChatPromptTemplate.from_messages([
+                    ("system", GENERAL_AGENT_PROMPT),
+                    ("human", "{input}"),
+                    ("ai", "{agent_scratchpad}")
+                ])
+                
+                # Определяем инструменты для RAG агента
+                rag_tools = [tool for tool in self.tools if tool.name == "rag_tool"]
+                
+                # Форматируем скретчпад агента
+                def _format_rag_scratchpad(steps):
+                    return format_to_openai_function_messages(steps)
+                
+                # Создаем и собираем агента
+                rag_agent = (
+                    {
+                        "input": lambda x: x["input"],
+                        "agent_scratchpad": lambda x: _format_rag_scratchpad(x["intermediate_steps"]),
+                        "tools": lambda x: rag_tools
+                    }
+                    | rag_prompt
+                    | self.llm.bind(functions=[format_tool_to_openai_function(tool) for tool in rag_tools])
+                    | OpenAIFunctionsAgentOutputParser()
+                )
+                
+                # Создаем исполнитель агента
+                self.rag_agent_executor = AgentExecutor(agent=rag_agent, tools=rag_tools, verbose=True)
+                logger.info("RAG ReAct агент успешно создан")
+            else:
+                self.rag_agent_executor = None
+                logger.info("RAG ReAct агент не создан (нет поддержки function-calling)")
+            
+            # 4. Создаем общий агент для прямых ответов
+            if self.supports_functions:
+                logger.info("Создание общего ReAct агента с function-calling")
+                from prompts import GENERAL_AGENT_PROMPT
+                # Создаем промпт для общего агента
+                general_prompt = ChatPromptTemplate.from_messages([
+                    ("system", GENERAL_AGENT_PROMPT),
+                    ("human", "{input}"),
+                    ("ai", "{agent_scratchpad}")
+                ])
+                
+                # Определяем инструменты для общего агента (все инструменты)
+                general_tools = self.tools
+                
+                # Форматируем скретчпад агента
+                def _format_general_scratchpad(steps):
+                    return format_to_openai_function_messages(steps)
+                
+                # Создаем и собираем агента
+                general_agent = (
+                    {
+                        "input": lambda x: x["input"],
+                        "agent_scratchpad": lambda x: _format_general_scratchpad(x["intermediate_steps"]),
+                        "tools": lambda x: general_tools
+                    }
+                    | general_prompt
+                    | self.llm.bind(functions=[format_tool_to_openai_function(tool) for tool in general_tools])
+                    | OpenAIFunctionsAgentOutputParser()
+                )
+                
+                # Создаем исполнитель агента
+                self.general_agent_executor = AgentExecutor(agent=general_agent, tools=general_tools, verbose=True)
+                logger.info("Общий ReAct агент успешно создан")
+            else:
+                # Для моделей без поддержки функций используем fallback на LangGraph
+                self.general_agent_executor = None
+                logger.info("Общий ReAct агент не создан (нет поддержки function-calling)")
+        except Exception as e:
+            logger.error(f"Ошибка при инициализации агентов: {str(e)}", exc_info=True)
+            # Устанавливаем исполнителей в None при ошибке
+            self.sql_agent_executor = None
+            self.rag_agent_executor = None
+            self.general_agent_executor = None
     
     def _create_rag_graph(self):
         """
@@ -764,142 +1331,149 @@ class RAGAssistant:
         
         return formatted_context, context_chunks
 
-    def answer_query(self, query: str, history: List[List[str]]) -> Tuple[str, List[Dict], Optional[str]]:
+    def process_query(self, query: str, history: List[List[str]] = None) -> Tuple[str, List[Dict], Optional[str]]:
         """
-        Отвечает на вопрос с использованием LangGraph RAG процесса или Oracle Text2SQL инструмента
+        Обрабатывает запрос с использованием роутера и соответствующего ReAct агента
         
         Args:
-            query: Текущий запрос пользователя
-            history: История диалога в формате [[user_msg1, assistant_msg1], [user_msg2, assistant_msg2], ...]
+            query: Запрос пользователя
+            history: История диалога (опционально)
             
         Returns:
             Кортеж (ответ, список источников, run_id для LangSmith)
         """
-        # Объявляем глобальную переменную в начале функции
         global LAST_RUN_ID
+        sources = []
+        run_id = None
         
         try:
-            logger.info(f"Обработка запроса: {query}")
+            logger.info(f"Обработка запроса через ReAct архитектуру: {query[:100]}...")
             
-            # Проверяем, является ли запрос связанным с БД
-            query_lower = query.lower()
-            is_db_query = False
+            # Шаг 1: Маршрутизация запроса через router_chain
+            if self.supports_functions:
+                # Используем роутер с function-calling
+                try:
+                    logger.info("Определение маршрута с помощью function-calling роутера")
+                    with trace(name="router_decision") as router_run:
+                        routing_result = self.router_chain.invoke({"question": query})
+                        route = routing_result.get("route", "direct")
+                        logger.info(f"Роутер определил маршрут: {route}")
+                        if router_run:
+                            run_id = router_run.id
+                except Exception as router_err:
+                    logger.error(f"Ошибка при маршрутизации запроса: {router_err}", exc_info=True)
+                    route = "direct"  # Используем прямой ответ как fallback
+                    logger.info(f"Установлен fallback маршрут: {route}")
+            else:
+                # Роутер без function-calling на основе регулярных выражений
+                try:
+                    logger.info("Определение маршрута с помощью regex-роутера")
+                    with trace(name="router_decision") as router_run:
+                        response = self.router_chain.invoke({"question": query})
+                        # Извлекаем маршрут из ответа регулярным выражением
+                        route_match = re.search(r"Route:\s*(database|documents|direct)", response, re.IGNORECASE)
+                        route = route_match.group(1).lower() if route_match else "direct"
+                        logger.info(f"Роутер определил маршрут: {route}")
+                        if router_run:
+                            run_id = router_run.id
+                except Exception as router_err:
+                    logger.error(f"Ошибка при маршрутизации запроса: {router_err}", exc_info=True)
+                    route = "direct"  # Используем прямой ответ как fallback
+                    logger.info(f"Установлен fallback маршрут: {route}")
             
-            # Проверяем, есть ли явные указания на запрос к БД в текущем запросе
-            if self.oracle_tool and self.oracle_tool.is_connected:
-                # Ключевые слова, которые явно указывают на запрос к БД
-                explicit_db_keywords = [
-                    'таблица', 'таблицы', 'таблицу', 'таблицей',
-                    'база данных', 'базы данных', 'базе данных',
-                    'select', 'insert', 'update', 'delete', 'from', 'where',
-                    'сколько', 'покажи', 'выведи', 'найди', 'найти',
-                    'все записи', 'всех клиентов', 'все заказы',
-                    'количество', 'количества', 'количеству'
-                ]
-                
-                # Проверяем наличие ключевых слов в запросе
-                is_db_query = any(keyword in query_lower for keyword in explicit_db_keywords)
-                
-                # Проверяем наличие шаблонов запросов к БД
-                db_query_patterns = [
-                    'сколько всего',
-                    'количество записей',
-                    'выведи список',
-                    'покажи всех',
-                    'найди всех',
-                    'из таблицы',
-                    'в таблице',
-                    'в бд',
-                    'в базе данных'
-                ]
-                
-                if not is_db_query:
-                    is_db_query = any(pattern in query_lower for pattern in db_query_patterns)
-                
-                # Логируем решение
-                logger.info(f"Определение типа запроса: is_db_query={is_db_query} для запроса: {query}")
+            # Шаг 2: Выполнение запроса с соответствующим агентом
+            if route == "database" and self.sql_agent_executor:
+                # Запрос к базе данных через SQL агент
+                logger.info("Выполнение SQL запроса через специализированный агент")
+                with trace(name="sql_agent_execution") as sql_run:
+                    response = self.sql_agent_executor.invoke({"input": query})
+                    answer = response.get("output", "")
+                    if sql_run:
+                        run_id = sql_run.id
+                        
+            elif route == "documents" and self.rag_agent_executor:
+                # Поиск в документах через RAG агент
+                logger.info("Выполнение поиска в документах через специализированный агент")
+                with trace(name="rag_agent_execution") as rag_run:
+                    response = self.rag_agent_executor.invoke({"input": query})
+                    answer = response.get("output", "")
+                    # Проверяем, есть ли информация об источниках в ответе
+                    if "sources" in response:
+                        sources = response["sources"]
+                    if rag_run:
+                        run_id = rag_run.id
+                        
+            elif self.general_agent_executor:
+                # Прямой ответ через общий агент
+                logger.info("Выполнение запроса через общий агент")
+                with trace(name="general_agent_execution") as general_run:
+                    response = self.general_agent_executor.invoke({"input": query})
+                    answer = response.get("output", "")
+                    if "sources" in response:
+                        sources = response["sources"]
+                    if general_run:
+                        run_id = general_run.id
+                        
+            else:
+                # Fallback к LangGraph если агенты не доступны
+                logger.info("Fallback к LangGraph RAG")
+                return self._fallback_to_langgraph(query, history)
             
-            # Если это запрос к БД и Oracle инструмент доступен и подключен
-            logger.info(f"is_db_query: {is_db_query}, oracle_tool: {self.oracle_tool}, is_connected: {self.oracle_tool.is_connected}")
-            if is_db_query and self.oracle_tool and self.oracle_tool.is_connected:
-                logger.info("Обработка запроса с помощью Oracle Text2SQL")
+            # Сохраняем run_id для последующего доступа
+            if run_id:
+                LAST_RUN_ID = run_id
+                logger.info(f"LangSmith run_id: {run_id} сохранен в LAST_RUN_ID")
                 
-                with trace(name="oracle_text2sql_query") as run:
-                    # Получаем информацию о схеме БД
-                    schema_info = self.oracle_tool.get_schema_info()
-                    
-                    # Генерируем SQL запрос
-                    # Пока у нас нет специальных таблиц, используем схему общую
-                    sql_query = self.oracle_tool.generate_sql(query, schema_info)
-                    # Убираем точку с запятой в конце запроса, чтобы избежать ошибки Oracle
-                    sql_query = sql_query.strip()
-                    if sql_query.endswith(';'):
-                        sql_query = sql_query[:-1]
-                    logger.info(f"Сгенерирован SQL запрос: {sql_query}")
-                    
-                    # Выполняем SQL запрос
-                    results, error = self.oracle_tool.execute_sql(sql_query)
-                    
-                    # Форматируем результаты в HTML таблицу
-                    formatted_results = format_results_as_html(results) if results else ""
-                    
-                    # Формируем ответ
-                    answer = f"Я сгенерировал SQL запрос на основе вашего вопроса:\n\n```sql\n{sql_query}\n```\n\n"
-                    
-                    if error:
-                        # Если есть ошибка при выполнении запроса
-                        answer += f"\n**Ошибка при выполнении запроса:**\n\n```\n{error}\n```\n\n"
-                        answer += "\nЯ могу попробовать исправить запрос или предложить альтернативный подход, если вы уточните ваш вопрос."
-                    elif results:
-                        # Добавляем результаты
-                        answer += f"\n**Результаты запроса:**\n\n{formatted_results}"
-                    else:
-                        answer += "\nЗапрос выполнен успешно, но не вернул результатов. Возможно, это был INSERT, UPDATE или DELETE запрос, либо запрос не нашел соответствующих данных."
-                    
-                    # Добавляем источники (таблицы, используемые в запросе)
-                    tables_used = extract_tables_from_sql(sql_query)
-                    sources = [{
-                        'text': f"Таблица: {table}",
-                        'metadata': {'source_type': 'oracle_db', 'table': table},
-                        'source_type': 'oracle_db'
-                    } for table in tables_used]
-                    
-                    # Получаем run_id для LangSmith
-                    if run is not None:
-                        run_id = run.id
-                        # Сохраняем в глобальной переменной
-                        LAST_RUN_ID = run_id
-                        logger.info(f"LangSmith run_id: {run_id} сохранен в LAST_RUN_ID")
-                
-                return answer, sources, run_id
+            # Форматируем источники для отображения, если есть
+            sources_html = format_source_display(sources) if sources else None
             
-            # Если это не запрос к БД или Oracle не настроен, используем обычный RAG процесс
-            # Создаем начальное состояние для LangGraph
+            return answer, sources, sources_html
+            
+        except Exception as e:
+            logger.error(f"Ошибка при обработке запроса через ReAct агенты: {str(e)}", exc_info=True)
+            # Fallback к LangGraph при ошибке
+            logger.info("Fallback к LangGraph RAG из-за ошибки")
+            return self._fallback_to_langgraph(query, history)
+    
+    def _fallback_to_langgraph(self, query: str, history: List[List[str]] = None) -> Tuple[str, List[Dict], Optional[str]]:
+        """
+        Fallback метод для использования LangGraph RAG процесса
+        
+        Args:
+            query: Запрос пользователя
+            history: История диалога
+            
+        Returns:
+            Кортеж (ответ, список источников, run_id для LangSmith)
+        """
+        global LAST_RUN_ID
+        run_id = None
+        
+        try:
+            logger.info(f"Переход на fallback через LangGraph для запроса: {query[:100]}...")
+            
+            # Создаем правильный формат входных данных для LangGraph
             initial_state = {
                 "question": query,
-                "chat_history": history,
+                "chat_history": history if history else [],  # Ключ chat_history вместо history для совместимости
                 "context": [],
                 "formatted_context": "",
                 "answer": None,
                 "sources": []
             }
             
-            # Создаем конфигурацию для трейсинга в LangSmith
+            # Конфигурация для LangSmith
             config = {}
-            run_id = None
-            
             if LANGCHAIN_API_KEY:
                 config = {
                     "configurable": {
                         "project_name": LANGCHAIN_PROJECT,
-                        "tags": ["rag", "production"]
+                        "tags": ["rag", "fallback", "production"]
                     }
                 }
             
-            # Запускаем LangGraph
-            logger.info("Запуск LangGraph RAG процесса...")
             # Используем trace внутри функции вместо декоратора
-            with trace(name="answer_query") as run:
+            with trace(name="fallback_rag") as run:
                 final_state = self.graph.invoke(initial_state, config=config)
                 # Получаем run_id для LangSmith
                 if run is not None:
@@ -911,12 +1485,28 @@ class RAGAssistant:
             # Получаем результаты
             answer = final_state.get("answer", RETRIEVAL_ERROR_MESSAGE)
             sources = final_state.get("sources", [])
+            # Форматируем источники для отображения
+            sources_html = format_source_display(sources)
             
-            return answer, sources, run_id
+            return answer, sources, sources_html
             
         except Exception as e:
             logger.error(f"Ошибка при обработке запроса через LangGraph: {str(e)}", exc_info=True)
             return f"Произошла ошибка при обработке запроса: {str(e)}", [], None
+            
+    def answer_query(self, query: str, history: List[List[str]]) -> Tuple[str, List[Dict], Optional[str]]:
+        """
+        Отвечает на вопрос с использованием ReAct агентов и роутера, с fallback на LangGraph RAG
+        
+        Args:
+            query: Текущий запрос пользователя
+            history: История диалога в формате [[user_msg1, assistant_msg1], [user_msg2, assistant_msg2], ...]
+            
+        Returns:
+            Кортеж (ответ, список источников, run_id для LangSmith)
+        """
+        # Используем новый метод process_query с ReAct агентами и роутером
+        return self.process_query(query, history)
     
     def save_feedback(self, query: str, response: str, rating: int, comments: str = "", run_id: Optional[str] = None):
         """
@@ -1051,48 +1641,68 @@ def chat_with_feedback(message, history):
 
 
 
-def format_source_display(sources: List[Dict[str, Any]]) -> str:
+def format_source_display(sources: List[Any]) -> str:
     """Форматирует список источников в HTML для отображения
     
     Args:
-        sources: Список словарей с информацией об источниках
+        sources: Список источников любого формата (словари или списки)
         
     Returns:
         HTML-строка с отформатированными источниками
     """
-    if not sources:
+    if not sources or len(sources) == 0:
         return "<div>Источники не найдены</div>"
     
     html_parts = ["<div style='margin-top: 20px;'><h4>Источники:</h4><div style='padding-left: 20px;'>"]
     logger.info(f"Количество источников: {len(sources)}")
     logger.info(f"Источники: {sources}")
-    for i, source in enumerate(sources[:5]):  # Ограничиваем количество отображаемых источников
-        # Извлекаем метаданные и текст, если они есть
-        metadata = source.get('metadata', {})
-        sub_metadata = metadata.get('metadata', {})
-        source_name = sub_metadata.get('source', 'Неизвестный источник')
-        page = sub_metadata.get('page', '')
-        text = source.get('text', '')[:100]  # Берем первые 100 символов текста
-        
-        # Формируем отображаемое имя источника
-        display_name = f"{source_name}"
-        if page:
-            display_name += f" (стр. {page})"
-        
-        # Добавляем ссылку, если есть
-        link_start = f"<a href='{metadata['url']}' target='_blank'>" if 'url' in metadata else ""
-        link_end = "</a>" if 'url' in metadata else ""
-        
-        # Формируем элемент списка с текстом
-        html_parts.append(f"""
-        <div>
-            <div>{link_start}{display_name}{link_end}</div>
-            <div style='color: #666; font-size: 0.9em; margin-top: 3px;'>{text}...</div>
-        </div>
-        """)
+    
+    try:
+        # Обработка источников, учитывая возможные разные форматы данных
+        for i, source in enumerate(sources[:5]):  # Ограничиваем количество отображаемых источников
+            try:
+                # Проверка типа источника и обработка соответствующим образом
+                if isinstance(source, dict):
+                    # Стандартный формат источника (словарь)
+                    metadata = source.get('metadata', {})
+                    sub_metadata = metadata.get('metadata', {}) if isinstance(metadata, dict) else {}
+                    source_name = sub_metadata.get('source', 'Неизвестный источник') if isinstance(sub_metadata, dict) else 'Неизвестный источник'
+                    page = sub_metadata.get('page', '') if isinstance(sub_metadata, dict) else ''
+                    text = source.get('text', '')[:100] if isinstance(source.get('text', ''), str) else str(source)[:100]  # Берем первые 100 символов текста
+                    
+                    # Формируем отображаемое имя источника
+                    display_name = f"{source_name}"
+                    if page:
+                        display_name += f" (стр. {page})"
+                    
+                    # Добавляем ссылку, если есть
+                    link_start = f"<a href='{metadata['url']}' target='_blank'>" if isinstance(metadata, dict) and 'url' in metadata else ""
+                    link_end = "</a>" if isinstance(metadata, dict) and 'url' in metadata else ""
+                elif isinstance(source, list) and len(source) >= 2:
+                    # Формат [query, answer]
+                    display_name = "Результат запроса"
+                    text = str(source[1])[:100]
+                    link_start = ""
+                    link_end = ""
+                else:
+                    # Неизвестный формат - пытаемся вывести хоть что-то
+                    display_name = "Источник"
+                    text = str(source)[:100]
+                    link_start = ""
+                    link_end = ""
+                
+                # Формируем элемент списка с текстом
+                html_parts.append(f"<div><div>{link_start}{display_name}{link_end}</div><div style='color: #666; font-size: 0.9em; margin-top: 3px;'>{text}...</div></div>")
+            except Exception as source_err:
+                logger.error(f"Ошибка при форматировании источника {i}: {source_err}")
+                html_parts.append(f"<div>Источник {i+1}: [Ошибка форматирования]</div>")
+    except Exception as format_err:
+        logger.error(f"Общая ошибка при форматировании источников: {format_err}")
+        return "<div>Ошибка при форматировании источников</div>"
     
     html_parts.append("</div>")
-    return "\n".join(html_parts)
+    html_parts.append("</div>")
+    return "".join(html_parts)
 
 # Функции для работы с Oracle Text2SQL
 oracle_tool = None

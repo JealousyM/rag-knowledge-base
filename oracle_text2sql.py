@@ -49,6 +49,7 @@ class OracleText2SQL:
         service_name: str = None,
         user: str = None,
         password: str = None,
+        llm=None,
         model_type: str = "openai",
         model_name: str = "gpt-3.5-turbo",
         temperature: float = 0.0,
@@ -63,10 +64,11 @@ class OracleText2SQL:
             service_name: Имя сервиса Oracle
             user: Имя пользователя
             password: Пароль
-            model_type: Тип модели для генерации SQL (openai или local)
-            model_name: Название модели
-            temperature: Температура для генерации (рекомендуется 0.0 для детерминированных запросов)
-            llm_local_path: Путь к локальной модели (если model_type='local')
+            llm: Готовый экземпляр LLM (если передан, другие параметры модели игнорируются)
+            model_type: Тип модели для генерации SQL (openai или local) если llm=None
+            model_name: Название модели если llm=None
+            temperature: Температура для генерации (рекомендуется 0.0) если llm=None
+            llm_local_path: Путь к локальной модели (если model_type='local') если llm=None
         """
         # Параметры подключения к Oracle
         self.host = host or os.environ.get("ORACLE_HOST")
@@ -80,8 +82,13 @@ class OracleText2SQL:
         self.model_name = model_name
         self.temperature = temperature
         
-        # Инициализация LLM
-        self.llm = self._initialize_llm(model_type, model_name, temperature, llm_local_path)
+        # Используем переданную модель или инициализируем новую
+        if llm is not None:
+            logger.info(f"Используется переданный экземпляр LLM: {type(llm).__name__}")
+            self.llm = llm
+        else:
+            logger.info(f"Создание нового экземпляра LLM: {model_name}")
+            self.llm = self._initialize_llm(model_type, model_name, temperature, llm_local_path)
         
         # Сохраняем схему БД
         self.schema = None
