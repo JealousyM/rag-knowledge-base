@@ -687,8 +687,12 @@ class RAGAssistant:
                         if not oracle_instance:
                             return "Oracle Text2SQL не инициализирован, не могу выполнить запрос к БД."
                         
-                        schema_info = oracle_instance.get_schema_info()
-                        sql_query = oracle_instance.generate_sql(question, schema_info)
+                        # Закомментировано из-за ошибки ORA-01795: maximum number of expressions in a list is 1000
+                        # schema_info = oracle_instance.get_schema_info()
+                        # sql_query = oracle_instance.generate_sql(question, schema_info)
+                        
+                        # Генерируем SQL напрямую, без схемы
+                        sql_query = oracle_instance.generate_sql(question, schema_override="")
                         sql_query = sql_query.strip().rstrip(";")  # убираем ; в конце
                         logger.info(f"Сгенерирован SQL запрос: {sql_query}")
                         
@@ -763,10 +767,13 @@ class RAGAssistant:
                     context_text = "Найденная информация из документов:\n\n"
                     for i, doc in enumerate(docs[:5], 1):
                         try:
+                            # Инициализируем переменные для хранения контента и метаданных
+                            content = None
+                            source_info = {}
+                            
                             # Обработка ScoredPoint объектов на основе отладочных данных
-                            # ScoredPoint объекты должны иметь поле payload с текстовым содержимым
                             if hasattr(doc, 'payload') and isinstance(doc.payload, dict):
-                                # В Qdrant содержимое обычно хранится в payload под ключами page_content или text
+                                # Извлекаем контент из payload
                                 if 'page_content' in doc.payload:
                                     content = doc.payload['page_content']
                                 elif 'text' in doc.payload:
@@ -787,9 +794,23 @@ class RAGAssistant:
                                     else:
                                         # Если нет длинных текстовых полей, возвращаем весь payload
                                         content = str(doc.payload)
+                                
+                                # Извлекаем метаданные из payload
+                                if 'metadata' in doc.payload and isinstance(doc.payload['metadata'], dict):
+                                    source_info = doc.payload['metadata']
+                                else:
+                                    # Ищем ключи метаданных непосредственно в payload
+                                    metadata_keys = ['source', 'title', 'url', 'filename', 'path', 'document_id']
+                                    for key in metadata_keys:
+                                        if key in doc.payload:
+                                            source_info[key] = doc.payload[key]
+                            
                             # Обработка стандартных документов LangChain
                             elif hasattr(doc, 'page_content'):
                                 content = doc.page_content
+                                # Пытаемся получить метаданные
+                                if hasattr(doc, 'metadata') and isinstance(doc.metadata, dict):
+                                    source_info = doc.metadata
                             elif hasattr(doc, 'text'):
                                 content = doc.text
                             elif hasattr(doc, 'content'):
@@ -806,12 +827,42 @@ class RAGAssistant:
                                         content = f"[Не удалось извлечь содержимое из {type(doc).__name__}]"
                                 except:
                                     content = f"[Не удалось извлечь содержимое из {type(doc).__name__}]"
-                                    
+                            
+                            # Проверяем, если у объекта есть поле score, добавляем его в метаданные
+                            if hasattr(doc, 'score'):
+                                source_info['score'] = doc.score
+                                
                         except Exception as e:
                             logger.error(f"Ошибка при извлечении содержимого документа: {str(e)}")
                             content = f"[Ошибка при извлечении текста: {str(e)}]"
+                            source_info = {}
+                        
+                        # Форматируем источник с метаданными
+                        source_header = f"**Источник {i}**"
+                        
+                        # Добавляем информацию об источнике, если она есть
+                        if source_info:
+                            source_details = []
+                            if 'source' in source_info:
+                                source_details.append(f"Источник: {source_info['source']}")
+                            if 'title' in source_info:
+                                source_details.append(f"Название: {source_info['title']}")
+                            if 'url' in source_info:
+                                source_details.append(f"URL: {source_info['url']}")
+                            if 'filename' in source_info:
+                                source_details.append(f"Файл: {source_info['filename']}")
+                            if 'path' in source_info:
+                                source_details.append(f"Путь: {source_info['path']}")
+                            if 'document_id' in source_info:
+                                source_details.append(f"ID документа: {source_info['document_id']}")
+                            if 'score' in source_info:
+                                source_details.append(f"Релевантность: {source_info['score']:.2f}")
                             
-                        context_text += f"**Источник {i}**\n{content}\n\n"
+                            # Если есть детали источника, добавляем их
+                            if source_details:
+                                source_header += "\n" + "\n".join(source_details)
+                        
+                        context_text += f"{source_header}\n{content}\n\n"
                     
                     return context_text
             except Exception as ex:
@@ -832,6 +883,90 @@ class RAGAssistant:
         
         tools.append(direct_answer)
         logger.info("Инструмент direct_answer создан и добавлен")
+        
+        # Создаем инструмент для визуализации графа
+        @tool
+        def show_graph_tool(query: str = "") -> str:
+            """Показывает структуру графа агентов и инструментов в системе. 
+            Используй этот инструмент, когда пользователь хочет увидеть архитектуру системы или как связаны компоненты."""
+            logger.info(f"Вызов инструмента show_graph_tool")
+        
+            # Визуализируем граф и сохраняем его как изображение для отображения в чате
+            try:
+                import os
+                import base64
+                from pathlib import Path
+                from datetime import datetime
+            
+                # Путь для сохранения статического изображения
+                static_dir = Path("./static/images")
+                static_dir.mkdir(exist_ok=True, parents=True)
+            
+                # Создаем уникальное имя файла с тиместампом
+                file_name = f"graph_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                image_path = static_dir / file_name
+            
+                # Отображаем визуализацию графа, если граф доступен
+                if self.graph and hasattr(self.graph, 'get_graph'):
+                    logger.info("Генерация визуализации графа и сохранение в файл")
+                
+                    # Сохраняем изображение графа
+                    png_data = self.graph.get_graph().draw_mermaid_png()
+            
+                    # Сохраняем PNG в файл
+                    with open(image_path, "wb") as f:
+                        f.write(png_data)
+                    
+                    logger.info(f"Изображение графа сохранено: {image_path}")
+                    
+                    # Кодируем в base64 и сохраняем в отдельный файл
+                    b64_data = base64.b64encode(png_data).decode('ascii')
+                    base64_file_name = f"graph_b64_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                    base64_file_path = static_dir / base64_file_name
+                    
+                    # Сохраняем base64 данные в файл
+                    with open(base64_file_path, "w") as f:
+                        f.write(f"data:image/png;base64,{b64_data}")
+                    
+                    # Преобразуем путь к файлу для корректной работы с ОС
+                    standard_path = str(base64_file_path).replace('\\', '/')
+                    
+                    logger.info(f"Base64 данные изображения сохранены в: {base64_file_path}")
+                    
+                    # Добавляем специальный маркер с путем к файлу base64
+                    text_description = f"""
+## Структура системы RAG
+
+<B64FILE>{standard_path}</B64FILE>
+
+### Агенты
+- **Роутер-агент** - Определяет тип запроса и выбирает специализированного агента
+- **SQL-агент** - Запросы к базе данных через Oracle
+- **RAG-агент** - Поиск в документах через векторное хранилище
+- **Общий агент** - Ответы без внешних источников
+
+### Инструменты
+- **database_tool** - Запросы к Oracle базе данных
+- **rag_tool** - Векторный поиск в документах
+- **direct_answer** - Ответы без поиска во внешних источниках
+- **show_graph_tool** - Визуализация графа системы
+
+### Технологии
+- LangChain + LangGraph для оркестрации агентов
+- Oracle Text2SQL для работы с базой данных
+- Qdrant + BM25 для гибридного поиска
+"""
+                
+                    return text_description
+                else:
+                    logger.warning("Граф недоступен для визуализации")
+                    return "Извините, граф системы недоступен для визуализации."
+            except Exception as e:
+                logger.error(f"Ошибка при создании визуализации графа: {str(e)}", exc_info=True)
+                return f"### Ошибка при визуализации графа\n\n```\n{str(e)}\n```\n\nПроверьте логи для получения дополнительной информации."
+        
+        tools.append(show_graph_tool)
+        logger.info("Инструмент show_graph_tool создан и добавлен")
         
         return tools
     
@@ -1345,6 +1480,7 @@ class RAGAssistant:
         global LAST_RUN_ID
         sources = []
         run_id = None
+        b64file_markers = []  # Для сохранения маркеров <B64FILE>
         
         try:
             logger.info(f"Обработка запроса через ReAct архитектуру: {query[:100]}...")
@@ -1381,6 +1517,19 @@ class RAGAssistant:
                     route = "direct"  # Используем прямой ответ как fallback
                     logger.info(f"Установлен fallback маршрут: {route}")
             
+            # Проверяем, содержит ли запрос просьбу показать граф или визуализацию системы
+            show_graph_keywords = [
+                'показать граф', 'показать структуру', 'визуализировать систему', 
+                'архитектура системы', 'диаграмма системы', 'как устроена система',
+                'покажи граф', 'визуализация графа', 'структура агентов'
+            ]
+            is_graph_request = any(keyword.lower() in query.lower() for keyword in show_graph_keywords)
+            
+            # Если запрос явно о графе, принудительно использовать общий агент с show_graph_tool
+            if is_graph_request:
+                logger.info("Обнаружен запрос на визуализацию графа системы, принудительное использование show_graph_tool")
+                route = "direct"  # Принудительно используем общий агент
+            
             # Шаг 2: Выполнение запроса с соответствующим агентом
             if route == "database" and self.sql_agent_executor:
                 # Запрос к базе данных через SQL агент
@@ -1406,9 +1555,73 @@ class RAGAssistant:
             elif self.general_agent_executor:
                 # Прямой ответ через общий агент
                 logger.info("Выполнение запроса через общий агент")
-                with trace(name="general_agent_execution") as general_run:
-                    response = self.general_agent_executor.invoke({"input": query})
-                    answer = response.get("output", "")
+                
+                # Если это запрос про граф, проверяем логи выполнения для извлечения маркеров
+                if is_graph_request:
+                    logger.info("Явный запрос на визуализацию графа. Будем искать B64FILE маркеры в выводе инструментов")
+                
+                # Для запросов визуализации графа мы вызываем show_graph_tool напрямую и возвращаем его результат
+                if is_graph_request:
+                    logger.info("Используем прямой вызов show_graph_tool для запроса визуализации графа")
+                    # Найдём инструмент show_graph_tool в списке инструментов
+                    for tool in self.tools:
+                        if hasattr(tool, 'name') and tool.name == 'show_graph_tool':
+                            logger.info("Инструмент show_graph_tool найден, вызываем напрямую")
+                            # Вызываем инструмент напрямую
+                            with trace(name="direct_graph_tool") as graph_run:
+                                graph_output = tool({})
+                                logger.info(f"Получен прямой вывод инструмента: {graph_output[:100]}...")
+                                # Используем вывод инструмента напрямую без обработки моделью
+                                answer = graph_output
+                                if graph_run:
+                                    run_id = graph_run.id
+                            break
+                else:
+                    # Для обычных запросов используем стандартное выполнение агента
+                    with trace(name="general_agent_execution") as general_run:
+                        response = self.general_agent_executor.invoke({"input": query})
+                        
+                        # Проверяем промежуточные шаги и логи
+                        original_tool_output = None
+                        if 'intermediate_steps' in response:
+                            logger.info("Проверка промежуточных шагов выполнения агента для маркеров B64FILE")
+                            for step in response['intermediate_steps']:
+                                if len(step) >= 2:
+                                    tool_name = getattr(step[0], 'tool', None) or getattr(step[0], 'name', 'unknown')
+                                    tool_output = str(step[1])
+                                    
+                                    logger.info(f"Проверка вывода инструмента {tool_name} на наличие B64FILE маркеров")
+                                    
+                                    # Если это вывод с графическим содержимым, ищем маркеры
+                                    import re
+                                    b64_matches = re.findall(r'<B64FILE>(.*?)</B64FILE>', tool_output)
+                                    if b64_matches:
+                                        logger.info(f"Найдены B64FILE маркеры в выводе инструмента: {b64_matches}")
+                                        b64file_markers.extend(b64_matches)
+                                        # Сохраняем оригинальный вывод инструмента
+                                        original_tool_output = tool_output
+                                        
+                        # Получаем ответ от агента
+                        answer = response.get("output", "")
+                        
+                        # Если были найдены маркеры B64FILE, но их нет в ответе,
+                        # добавляем их в ответ
+                        if b64file_markers and not re.search(r'<B64FILE>', answer):
+                            logger.info("В ответе нет B64FILE маркеров, но они были найдены в выводе инструментов")
+                            
+                            # Скорее всего, лучше вернуть оригинальный вывод инструмента
+                            if original_tool_output:
+                                logger.info("Заменяем ответ модели оригинальным выводом инструмента")
+                                answer = original_tool_output
+                            else:
+                                # Добавляем маркеры в ответ
+                                for marker in b64file_markers:
+                                    answer = f"<B64FILE>{marker}</B64FILE>\n\n{answer}"
+                                logger.info(f"Модифицированный ответ с маркерами: {answer[:100]}...")
+                        
+                        if general_run:
+                            run_id = general_run.id
+                    
                     if "sources" in response:
                         sources = response["sources"]
                     if general_run:
@@ -1585,6 +1798,9 @@ def chat_with_feedback(message, history):
     Обрабатывает взаимодействие пользователя с чатом
     и возвращает ответ с информацией об источниках
     """
+    import os
+    import re
+    
     logger.info(f"Получен запрос от пользователя: {message[:100]}...")
     logger.debug(f"Текущая история чата (до обработки): {history}")
     
@@ -1611,7 +1827,9 @@ def chat_with_feedback(message, history):
         
         # Генерируем ответ, используя метод answer_query
         response, sources, run_id = rag_assistant.answer_query(message, chat_history)
-        
+        logger.info(f"Ответ: {response}")
+        logger.info(f"Источники: {sources}")
+        logger.info(f"ID запроса: {run_id}")
         # Запоминаем ID запроса для отзывов
         global LAST_RUN_ID
         LAST_RUN_ID = run_id
@@ -1619,17 +1837,73 @@ def chat_with_feedback(message, history):
         # Форматируем источники для отображения
         sources_html = format_source_display(sources)
         
-        # Добавляем вопрос пользователя и ответ ассистента в историю
-        # Используем формат, совместимый с Gradio Chatbot
+        # Добавляем вопрос пользователя в историю
         history.append({"role": "user", "content": message})
-        history.append({"role": "assistant", "content": response})
+        
+        # Проверяем наличие маркеров изображений в тексте ответа
+        import re
+        
+        # Проверяем наличие тегов с путём к base64 файлу
+        b64file_pattern = r'<B64FILE>(.*?)</B64FILE>'
+        b64file_matches = re.findall(b64file_pattern, response)
+        
+        if b64file_matches:
+            logger.info(f"Обнаружены маркеры B64FILE: {len(b64file_matches)}")
+            
+            # Удаляем теги из текста ответа
+            cleaned_response = re.sub(b64file_pattern, '', response)
+            history.append({"role": "assistant", "content": cleaned_response.strip()})
+            
+            # Обрабатываем каждый маркер
+            for file_path in b64file_matches:
+                try:
+                    # Проверяем наличие файла
+                    if not os.path.exists(file_path):
+                        logger.error(f"Файл не найден: {file_path}")
+                        # Добавляем текстовое сообщение об ошибке вместо отсутствующего изображения
+                        history.append({"role": "assistant", "content": f"Ошибка: Изображение не найдено ({file_path})"})
+                        continue
+                    
+                    # Стандартизируем путь к файлу для совместимости с разными ОС
+                    normalized_path = os.path.normpath(file_path)
+                    logger.info(f"Normalized path: {normalized_path}")
+                    
+                    # Читаем данные base64 из файла
+                    with open(normalized_path, 'r') as f:
+                        file_content = f.read().strip()
+                    
+                    logger.info(f"Успешно прочитан файл base64: {file_path} (длина: {len(file_content)} символов)")
+                    
+                    # Добавляем префикс, если его нет, т.к. он необходим для Gradio
+                    if not file_content.startswith('data:image/png;base64,'):
+                        base64_only = f"data:image/png;base64,{file_content}"
+                        logger.info(f"Добавлен префикс 'data:image/png;base64,' к данным изображения")
+                    else:
+                        base64_only = file_content
+                        logger.info(f"Данные изображения уже с префиксом data:image/png;base64,")
+                    
+                    logger.info(f"Подготовлены данные изображения с правильным форматом (длина: {len(base64_only)})")
+                    logger.info(f"Добавляем изображение в историю чата")
+                    logger.info(base64_only)
+                    # Добавляем как изображение в историю чата
+                    # Для Gradio Chatbot необходимо указать пустую строку вместо None для поля content
+                    img = "<img src='" + base64_only + "' alt='Image'>"
+                    history.append({"role": "assistant", "content": img})
+                    logger.info(f"Добавлено изображение в чат (base64 данные длиной: {len(base64_only)})")
+                except Exception as img_err:
+                    logger.error(f"Ошибка при обработке base64 файла {file_path}: {str(img_err)}")
+        else:
+            logger.info(f"Добавляем ответ как текст, есть проблема с изображением")
+            # Если нет маркеров, просто добавляем ответ как текст
+            history.append({"role": "assistant", "content": response})
         
         # Ограничиваем длину истории
         if len(history) > MAX_HISTORY_LENGTH * 2:  # Умножаем на 2, так как каждая пара вопрос-ответ - это 2 элемента
             removed_count = len(history) - MAX_HISTORY_LENGTH * 2
             history = history[-MAX_HISTORY_LENGTH * 2:]
             logger.debug(f"История чата обрезана. Удалено {removed_count} старых сообщений")
-        
+        logger.info(f"История чата: {history}")
+        logger.info(f"Источники: {sources_html}")
         logger.info("Запрос успешно обработан")
         return "", history, sources_html
     
@@ -1670,6 +1944,30 @@ def format_source_display(sources: List[Any]) -> str:
                     page = sub_metadata.get('page', '') if isinstance(sub_metadata, dict) else ''
                     text = source.get('text', '')[:100] if isinstance(source.get('text', ''), str) else str(source)[:100]  # Берем первые 100 символов текста
                     
+                    # Кодируем PNG данные в base64 и сохраняем в файл
+                    import base64
+                    import os
+                    b64_data = base64.b64encode(png_data).decode('ascii')
+                    
+                    # Путь к файлу с base64 данными
+                    os.makedirs("static/images", exist_ok=True)  # создаем директорию, если нет
+                    base64_file_name = f"graph_b64_{timestamp}.txt"
+                    base64_file_path = os.path.join("static/images", base64_file_name)
+                    
+                    # Сохраняем base64 в файл
+                    with open(base64_file_path, "w") as f:
+                        f.write(f"data:image/png;base64,{b64_data}")
+                    
+                    logger.info(f"Изображение сохранено в base64 формате: {base64_file_path}")
+                    
+                    # Добавляем маркер с путем к файлу base64
+                    text_description = f"""
+## Структура системы RAG
+
+<B64FILE>{base64_file_path}</B64FILE>
+
+### Агенты
+"""
                     # Формируем отображаемое имя источника
                     display_name = f"{source_name}"
                     if page:
@@ -2308,7 +2606,10 @@ if __name__ == "__main__":
         
         # Создаем экземпляр демонстрации
         demo = create_demo(rag_assistant)
-        demo.launch(server_name="0.0.0.0", share=False, server_port=7862)
+        
+        # Запуск Gradio интерфейса с поддержкой статических файлов
+        # Используем другой порт, так как 7862 может быть занят
+        demo.launch(server_port=7862, server_name="0.0.0.0", share=False, allowed_paths=["./static"])
     
     except Exception as e:
         logger.error(f"Ошибка при запуске приложения: {str(e)}")

@@ -40,3 +40,4 @@ torch
 transformers
 rank_bm25
 oracledb
+ipython

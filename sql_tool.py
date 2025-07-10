@@ -51,10 +51,12 @@ def _run_sql_tool(question: str) -> str:
         return "Oracle Text2SQL не инициализирован."
 
     # Получаем текстовую схему БД (можно оптимизировать кеширование)
-    schema_info = oracle_tool_instance.get_schema_info()
+    # Закомментировано из-за ошибки ORA-01795: maximum number of expressions in a list is 1000
+    # schema_info = oracle_tool_instance.get_schema_info()
 
     try:
-        sql_query = oracle_tool_instance.generate_sql(question, schema_info)
+        # Генерируем SQL напрямую, без схемы
+        sql_query = oracle_tool_instance.generate_sql(question, schema_override="")
         sql_query = sql_query.strip().rstrip(";")  # убираем ; в конце
         logger.info("\u0421\u0433\u0435\u043d\u0435\u0440\u0438\u0440\u043e\u0432\u0430\u043d SQL \u0434\u043b\u044f question '%s': %s", question, sql_query)
 

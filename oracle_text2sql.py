@@ -236,20 +236,26 @@ class OracleText2SQL:
             logger.error(f"Ошибка при получении схемы базы данных: {str(e)}")
             return f"Ошибка при получении схемы: {str(e)}"
     
-    def generate_sql(self, query: str, tables: Optional[List[str]] = None) -> str:
+    def generate_sql(self, query: str, schema_override: Optional[str] = None) -> str:
         """
         Генерирует SQL запрос из текстового запроса
         
         Args:
             query: Запрос на естественном языке
-            tables: Опционально список таблиц для уточнения схемы
+            schema_override: Если передана строка, она будет использована вместо получения схемы из БД
             
         Returns:
             SQL запрос
         """
-        # Если схема еще не получена или нужны определенные таблицы
-        if self.schema is None or tables:
-            self.schema = self.get_schema_info(tables)
+        # Используем переданную схему, если она предоставлена
+        if schema_override is not None:
+            schema_to_use = schema_override
+        # Иначе пытаемся получить схему из БД, если она еще не получена
+        elif self.schema is None:
+            self.schema = self.get_schema_info()
+            schema_to_use = self.schema
+        else:
+            schema_to_use = self.schema
         
         try:
             # Создаем цепочку для генерации SQL запроса
@@ -265,7 +271,7 @@ class OracleText2SQL:
                 )
                 
                 # Выполняем генерацию
-                sql_query = chain.invoke({"schema": self.schema, "query": query})
+                sql_query = chain.invoke({"schema": schema_to_use, "query": query})
                 
                 # Логируем результат
                 logger.info(f"Сгенерирован SQL запрос для: '{query[:50]}...'")
