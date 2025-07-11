@@ -1,74 +1,47 @@
 import sys
 import logging
 import json
-import os
 import time
-from typing import List, Dict, Union, Any, Optional, Tuple, Annotated, TypedDict
+import os
+import shutil
+from typing import List, Dict, Any, Optional, Tuple, TypedDict
 import uuid
-import re
-import numpy as np
-import pandas as pd
 import gradio as gr
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
-from sentence_transformers import SentenceTransformer
+from langchain.schema import Document
+from langchain.prompts import ChatPromptTemplate
 
 # LangChain imports
 from langchain_community.llms import LlamaCpp
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Qdrant
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document, AIMessage
-from langchain.schema.runnable import RunnableConfig, RunnableLambda, RunnablePassthrough
-from langchain.schema.output_parser import StrOutputParser
-from langchain.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
 from langchain.retrievers import BM25Retriever, EnsembleRetriever
-from langchain.agents import AgentType, initialize_agent, create_react_agent, AgentExecutor
+from langchain.agents import initialize_agent, create_react_agent, AgentExecutor
 from langchain.agents.format_scratchpad import format_to_openai_function_messages, format_to_openai_functions
-from langchain.output_parsers.openai_functions import JsonOutputFunctionsParser
-from langchain_openai import ChatOpenAI
-from langchain.tools import BaseTool, StructuredTool, tool
+from langchain.tools import tool
 from langchain.tools.convert_to_openai import format_tool_to_openai_function
 
 # LangGraph imports
 from langgraph.graph import END, StateGraph
-from langgraph.checkpoint.memory import MemorySaver
 
 # LangSmith tracing
-from langsmith import Client, trace
+from langsmith import trace
 
 # Local imports
 from prompts import SYSTEM_PROMPT
 from data_processing import RoSBERTaEmbeddings, Config
-
+from text_utils import format_search_results
 # Импорт класса для работы с Oracle Text2SQL
 from oracle_text2sql import OracleText2SQL
 from sql_tool import set_oracle_tool, get_oracle_tool
-
+from constants import *
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения
 load_dotenv()
-
-# Константы
-COLLECTION_NAME = "documents"
-MAX_CONTEXT_CHUNKS = 8  # Максимальное количество чанков для контекста
-LOADING_WEIGHTS_STR = "⚙️ Загружаю модель... это может занять несколько минут"
-MAX_HISTORY_LENGTH = 10  # Максимальное количество сообщений в истории
-LAST_RUN_ID = None  # Идентификатор последнего запуска в LangSmith для отзывов
-RETRIEVAL_ERROR_MESSAGE = "Извините, эта информация временно недоступна. Уточните детали у менеджера"
-MODEL_PATH = 'model/ru-en-RoSBERTa'
-
-# Для управления инструментом Oracle Text2SQL используется модуль sql_tool
-
-# Индикатор для отслеживания попыток доступа к БД
-DATABASE_KEYWORDS = ['база данных', 'бд', 'запрос', 'sql', 'oracle', 'таблиц', 'запис', 'столбц', 'выбери', 'найди в', 'покажи из']
-
-# Настройка LangSmith трейсинга
-LANGCHAIN_API_KEY = os.environ.get("LANGCHAIN_API_KEY")
-LANGCHAIN_PROJECT = os.environ.get("LANGCHAIN_PROJECT", "rag_assistant")
 
 # Инициализация компонентов
 # Загружаем модель для эмбеддингов из data_processing.py
@@ -872,18 +845,6 @@ class RAGAssistant:
         tools.append(rag_tool)
         logger.info("Инструмент rag_tool создан и добавлен")
         
-        # Инструмент для прямых ответов без использования внешних источников
-        @tool
-        def direct_answer(question: str) -> str:
-            """Отвечает на вопросы напрямую без поиска в документах или БД. Используй этот инструмент для простых 
-            вопросов, приветствий, или когда нужны только логические рассуждения/вычисления."""
-            logger.info(f"Вызов инструмента direct_answer с вопросом: {question}")
-            # Этот инструмент просто сигнализирует роутеру, что нужно отвечать напрямую
-            return "Отвечу на этот вопрос напрямую, используя общие знания, логику или математические вычисления."
-        
-        tools.append(direct_answer)
-        logger.info("Инструмент direct_answer создан и добавлен")
-        
         # Создаем инструмент для визуализации графа
         @tool
         def show_graph_tool(query: str = "") -> str:
@@ -943,12 +904,10 @@ class RAGAssistant:
 - **Роутер-агент** - Определяет тип запроса и выбирает специализированного агента
 - **SQL-агент** - Запросы к базе данных через Oracle
 - **RAG-агент** - Поиск в документах через векторное хранилище
-- **Общий агент** - Ответы без внешних источников
 
 ### Инструменты
 - **database_tool** - Запросы к Oracle базе данных
 - **rag_tool** - Векторный поиск в документах
-- **direct_answer** - Ответы без поиска во внешних источниках
 - **show_graph_tool** - Визуализация графа системы
 
 ### Технологии
@@ -1424,48 +1383,6 @@ class RAGAssistant:
         logger.info("Создан и скомпилирован LangGraph для RAG")
         return graph
     
-    def format_search_results(self, results: List) -> Tuple[str, List[Dict]]:
-        """
-        Форматирует результаты поиска в контекст для модели
-        
-        Args:
-            results: Список объектов ScoredPoint из Qdrant
-            
-        Returns:
-            Кортеж (форматированный контекст, список чанков с метаданными)
-        """
-        context_chunks = []
-        formatted_context = ""
-        
-        for i, result in enumerate(results[:MAX_CONTEXT_CHUNKS]):
-            try:
-                # Получаем атрибуты из ScoredPoint
-                score = getattr(result, 'score', 0.0)
-                payload = getattr(result, 'payload', {})
-                
-                # Извлекаем текст и метаданные
-                text = payload.get('text', '')
-                metadata = {k: v for k, v in payload.items() if k != 'text'}
-                
-                # Добавляем в контекст для модели
-                if text:  # Добавляем только если есть текст
-                    chunk_context = f"[Документ {i+1}] {text}\n"
-                    formatted_context += chunk_context
-                
-                # Сохраняем для отображения источников
-                context_chunks.append({
-                    'text': text,
-                    'metadata': metadata,
-                    'score': float(score),  # Преобразуем в стандартный float
-                    'source_type': 'hybrid'  # Используем гибридный поиск
-                })
-                
-            except Exception as e:
-                logger.error(f"Ошибка при обработке результата поиска: {str(e)}", exc_info=True)
-                continue
-        
-        return formatted_context, context_chunks
-
     def process_query(self, query: str, history: List[List[str]] = None) -> Tuple[str, List[Dict], Optional[str]]:
         """
         Обрабатывает запрос с использованием роутера и соответствующего ReAct агента
@@ -1793,10 +1710,31 @@ class RAGAssistant:
             
         return success
 
+def clean_static_images():
+    """Очищает содержимое директории static/images"""
+    try:
+        images_dir = os.path.join('static', 'images')
+        if os.path.exists(images_dir):
+            # Удаляем все файлы в директории
+            for filename in os.listdir(images_dir):
+                file_path = os.path.join(images_dir, filename)
+                try:
+                    if os.path.isfile(file_path) or os.path.islink(file_path):
+                        os.unlink(file_path)
+                        logger.debug(f"Удален файл: {file_path}")
+                except Exception as e:
+                    logger.error(f"Ошибка при удалении файла {file_path}: {e}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Ошибка при очистке директории static/images: {e}")
+        return False
+
 def chat_with_feedback(message, history):
     """
-    Обрабатывает взаимодействие пользователя с чатом
-    и возвращает ответ с информацией об источниках
+    Обрабатывает взаимодействие пользователя с чатом,
+    возвращает ответ с информацией об источниках
+    и очищает директорию static/images после ответа
     """
     import os
     import re
@@ -1904,7 +1842,10 @@ def chat_with_feedback(message, history):
             logger.debug(f"История чата обрезана. Удалено {removed_count} старых сообщений")
         logger.info(f"История чата: {history}")
         logger.info(f"Источники: {sources_html}")
-        logger.info("Запрос успешно обработан")
+        # Очищаем директорию с изображениями после ответа
+        clean_static_images()
+        
+        # Возвращаем ответ и обновляем историю
         return "", history, sources_html
     
     except Exception as e:
@@ -2279,7 +2220,7 @@ def create_demo(rag_assistant):
                         msg = gr.Textbox(
                             placeholder="Введите ваш вопрос...",
                             label="Вопрос",
-                            lines=2
+                            lines=1
                         )
                         with gr.Row():
                             submit_btn = gr.Button("Отправить", variant="primary")

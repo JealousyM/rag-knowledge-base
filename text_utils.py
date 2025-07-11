@@ -1,5 +1,5 @@
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict
 import logging
 
 logger = logging.getLogger(__name__)
@@ -141,3 +141,45 @@ def split_into_semantic_chunks(text: str, max_chunk_size: int = 400, overlap: in
         return chunks_with_overlap
         
     return chunks
+
+def format_search_results(self, results: List) -> Tuple[str, List[Dict]]:
+    """
+    Форматирует результаты поиска в контекст для модели
+    
+    Args:
+        results: Список объектов ScoredPoint из Qdrant
+        
+    Returns:
+        Кортеж (форматированный контекст, список чанков с метаданными)
+    """
+    context_chunks = []
+    formatted_context = ""
+    
+    for i, result in enumerate(results[:MAX_CONTEXT_CHUNKS]):
+        try:
+            # Получаем атрибуты из ScoredPoint
+            score = getattr(result, 'score', 0.0)
+            payload = getattr(result, 'payload', {})
+            
+            # Извлекаем текст и метаданные
+            text = payload.get('text', '')
+            metadata = {k: v for k, v in payload.items() if k != 'text'}
+            
+            # Добавляем в контекст для модели
+            if text:  # Добавляем только если есть текст
+                chunk_context = f"[Документ {i+1}] {text}\n"
+                formatted_context += chunk_context
+            
+            # Сохраняем для отображения источников
+            context_chunks.append({
+                'text': text,
+                'metadata': metadata,
+                'score': float(score),  # Преобразуем в стандартный float
+                'source_type': 'hybrid'  # Используем гибридный поиск
+            })
+            
+        except Exception as e:
+            logger.error(f"Ошибка при обработке результата поиска: {str(e)}", exc_info=True)
+            continue
+    
+    return formatted_context, context_chunks
