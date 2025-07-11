@@ -1,6 +1,7 @@
 import re
 from typing import List, Optional, Tuple, Dict, Any
 import logging
+from constants import MAX_CONTEXT_CHUNKS
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,7 @@ def split_into_semantic_chunks(text: str, max_chunk_size: int = 400, overlap: in
         
     return chunks
 
-def format_search_results(self, results: List) -> Tuple[str, List[Dict]]:
+def format_search_results(results: List) -> Tuple[str, List[Dict]]:
     """
     Форматирует результаты поиска в контекст для модели
     
@@ -213,27 +214,9 @@ def format_source_display(sources: List[Any]) -> str:
                     page = sub_metadata.get('page', '') if isinstance(sub_metadata, dict) else ''
                     text = source.get('text', '')[:100] if isinstance(source.get('text', ''), str) else str(source)[:100]  # Берем первые 100 символов текста
                     
-                    # Кодируем PNG данные в base64 и сохраняем в файл
-                    import base64
-                    import os
-                    b64_data = base64.b64encode(png_data).decode('ascii')
-                    
-                    # Путь к файлу с base64 данными
-                    os.makedirs("static/images", exist_ok=True)  # создаем директорию, если нет
-                    base64_file_name = f"graph_b64_{timestamp}.txt"
-                    base64_file_path = os.path.join("static/images", base64_file_name)
-                    
-                    # Сохраняем base64 в файл
-                    with open(base64_file_path, "w") as f:
-                        f.write(f"data:image/png;base64,{b64_data}")
-                    
-                    logger.info(f"Изображение сохранено в base64 формате: {base64_file_path}")
-                    
-                    # Добавляем маркер с путем к файлу base64
-                    text_description = f"""
+                    # Обработка изображений временно отключена
+                    text_description = """
 ## Структура системы RAG
-
-<B64FILE>{base64_file_path}</B64FILE>
 
 ### Агенты
 """
