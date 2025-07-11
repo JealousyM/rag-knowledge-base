@@ -31,7 +31,8 @@ from langsmith import trace
 # Local imports
 from prompts import SYSTEM_PROMPT
 from data_processing import RoSBERTaEmbeddings, Config
-from text_utils import format_search_results
+from text_utils import format_search_results, format_source_display
+from file_utils import clean_static_images
 # Импорт класса для работы с Oracle Text2SQL
 from oracle_text2sql import OracleText2SQL
 from sql_tool import set_oracle_tool, get_oracle_tool
@@ -1710,26 +1711,6 @@ class RAGAssistant:
             
         return success
 
-def clean_static_images():
-    """Очищает содержимое директории static/images"""
-    try:
-        images_dir = os.path.join('static', 'images')
-        if os.path.exists(images_dir):
-            # Удаляем все файлы в директории
-            for filename in os.listdir(images_dir):
-                file_path = os.path.join(images_dir, filename)
-                try:
-                    if os.path.isfile(file_path) or os.path.islink(file_path):
-                        os.unlink(file_path)
-                        logger.debug(f"Удален файл: {file_path}")
-                except Exception as e:
-                    logger.error(f"Ошибка при удалении файла {file_path}: {e}")
-            return True
-        return False
-    except Exception as e:
-        logger.error(f"Ошибка при очистке директории static/images: {e}")
-        return False
-
 def chat_with_feedback(message, history):
     """
     Обрабатывает взаимодействие пользователя с чатом,
@@ -1853,95 +1834,6 @@ def chat_with_feedback(message, history):
         logger.error(error_msg, exc_info=True)
         history.append({"role": "assistant", "content": "Извините, произошла ошибка при обработке вашего запроса."})
         return "", history, ""
-
-
-
-def format_source_display(sources: List[Any]) -> str:
-    """Форматирует список источников в HTML для отображения
-    
-    Args:
-        sources: Список источников любого формата (словари или списки)
-        
-    Returns:
-        HTML-строка с отформатированными источниками
-    """
-    if not sources or len(sources) == 0:
-        return "<div>Источники не найдены</div>"
-    
-    html_parts = ["<div style='margin-top: 20px;'><h4>Источники:</h4><div style='padding-left: 20px;'>"]
-    logger.info(f"Количество источников: {len(sources)}")
-    logger.info(f"Источники: {sources}")
-    
-    try:
-        # Обработка источников, учитывая возможные разные форматы данных
-        for i, source in enumerate(sources[:5]):  # Ограничиваем количество отображаемых источников
-            try:
-                # Проверка типа источника и обработка соответствующим образом
-                if isinstance(source, dict):
-                    # Стандартный формат источника (словарь)
-                    metadata = source.get('metadata', {})
-                    sub_metadata = metadata.get('metadata', {}) if isinstance(metadata, dict) else {}
-                    source_name = sub_metadata.get('source', 'Неизвестный источник') if isinstance(sub_metadata, dict) else 'Неизвестный источник'
-                    page = sub_metadata.get('page', '') if isinstance(sub_metadata, dict) else ''
-                    text = source.get('text', '')[:100] if isinstance(source.get('text', ''), str) else str(source)[:100]  # Берем первые 100 символов текста
-                    
-                    # Кодируем PNG данные в base64 и сохраняем в файл
-                    import base64
-                    import os
-                    b64_data = base64.b64encode(png_data).decode('ascii')
-                    
-                    # Путь к файлу с base64 данными
-                    os.makedirs("static/images", exist_ok=True)  # создаем директорию, если нет
-                    base64_file_name = f"graph_b64_{timestamp}.txt"
-                    base64_file_path = os.path.join("static/images", base64_file_name)
-                    
-                    # Сохраняем base64 в файл
-                    with open(base64_file_path, "w") as f:
-                        f.write(f"data:image/png;base64,{b64_data}")
-                    
-                    logger.info(f"Изображение сохранено в base64 формате: {base64_file_path}")
-                    
-                    # Добавляем маркер с путем к файлу base64
-                    text_description = f"""
-## Структура системы RAG
-
-<B64FILE>{base64_file_path}</B64FILE>
-
-### Агенты
-"""
-                    # Формируем отображаемое имя источника
-                    display_name = f"{source_name}"
-                    if page:
-                        display_name += f" (стр. {page})"
-                    
-                    # Добавляем ссылку, если есть
-                    link_start = f"<a href='{metadata['url']}' target='_blank'>" if isinstance(metadata, dict) and 'url' in metadata else ""
-                    link_end = "</a>" if isinstance(metadata, dict) and 'url' in metadata else ""
-                elif isinstance(source, list) and len(source) >= 2:
-                    # Формат [query, answer]
-                    display_name = "Результат запроса"
-                    text = str(source[1])[:100]
-                    link_start = ""
-                    link_end = ""
-                else:
-                    # Неизвестный формат - пытаемся вывести хоть что-то
-                    display_name = "Источник"
-                    text = str(source)[:100]
-                    link_start = ""
-                    link_end = ""
-                
-                # Формируем элемент списка с текстом
-                html_parts.append(f"<div><div>{link_start}{display_name}{link_end}</div><div style='color: #666; font-size: 0.9em; margin-top: 3px;'>{text}...</div></div>")
-            except Exception as source_err:
-                logger.error(f"Ошибка при форматировании источника {i}: {source_err}")
-                html_parts.append(f"<div>Источник {i+1}: [Ошибка форматирования]</div>")
-    except Exception as format_err:
-        logger.error(f"Общая ошибка при форматировании источников: {format_err}")
-        return "<div>Ошибка при форматировании источников</div>"
-    
-    html_parts.append("</div>")
-    html_parts.append("</div>")
-    return "".join(html_parts)
 
 # Функции для работы с Oracle Text2SQL
 oracle_tool = None
