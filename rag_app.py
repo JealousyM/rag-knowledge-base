@@ -1,5 +1,6 @@
 import sys
 import logging
+import uuid
 from typing import List
 import gradio as gr
 from dotenv import load_dotenv
@@ -8,6 +9,7 @@ from qdrant_client import QdrantClient
 # Local imports
 from text_utils import format_source_display
 from file_utils import clean_static_images
+from memory_storage import MemoryStorage
 # Импорт класса для работы с Oracle Text2SQL
 from oracle_text2sql import OracleText2SQL
 from constants import *
@@ -25,8 +27,12 @@ load_dotenv()
 # Загружаем модель для эмбеддингов из data_processing.py
 # Так как мы уже загрузили модель в data_processing.py, мы используем ее напрямую
 from data_processing import EMBEDDING_MODEL
+
+# Инициализация хранилища памяти
+memory_storage = MemoryStorage()
+
         
-def chat_with_feedback(message, history):
+def chat_with_feedback(message, history, session_state):
     """
     Обрабатывает взаимодействие пользователя с чатом,
     возвращает ответ с информацией об источниках
@@ -40,12 +46,33 @@ def chat_with_feedback(message, history):
     
     if not message or message.strip() == "":
         logger.warning("Получен пустой запрос от пользователя")
-        return "", history, "Пожалуйста, введите ваш вопрос."
+        return "", history, "Пожалуйста, введите ваш вопрос.", session_state
     
+    if session_state is None:
+        session_state = {}
+    
+    session_id = session_state.get("session_id")
+    if not session_id:
+        session_id = str(uuid.uuid4())
+        session_state["session_id"] = session_id
+
     try:
+        # Сначала проверяем кэш
+        cached_answer, cached_sources = memory_storage.get_exact_answer(session_id, message)
+        if cached_answer:
+            logger.info("Найден точный ответ в кэше.")
+            sources_html = format_source_display(cached_sources)
+            history.append([message, cached_answer])
+            return "", history, sources_html, session_state
+
+        # Получаем историю из базы данных
+        db_history = memory_storage.get_conversation_history(session_id)
+        logger.info(f"Retrieved {len(db_history)} messages from long-term memory for session {session_id}.")
+
         # Преобразуем историю в формат для ассистента
         # Ожидаемый формат: [[user_msg1, assistant_msg1], [user_msg2, assistant_msg2], ...]
-        chat_history = []
+        # Сначала берем историю из БД, затем добавляем текущую историю из Gradio
+        chat_history = db_history
         if history:
             for i, item in enumerate(history):
                 # Если это словари, используем их content
@@ -71,84 +98,64 @@ def chat_with_feedback(message, history):
         # Форматируем источники для отображения
         sources_html = format_source_display(sources)
         
-        # Добавляем вопрос пользователя в историю
-        history.append({"role": "user", "content": message})
-        
-        # Проверяем наличие маркеров изображений в тексте ответа
-        import re
-        
+        # Формируем ответ ассистента, включая обработку изображений
+        assistant_response_html = ""
+
         # Проверяем наличие тегов с путём к base64 файлу
         b64file_pattern = r'<B64FILE>(.*?)</B64FILE>'
         b64file_matches = re.findall(b64file_pattern, response)
-        
+
+        # Удаляем теги из основного текста ответа
+        cleaned_response = re.sub(b64file_pattern, '', response).strip()
+        if cleaned_response:
+            assistant_response_html += f"<div>{cleaned_response}</div>"
+
         if b64file_matches:
             logger.info(f"Обнаружены маркеры B64FILE: {len(b64file_matches)}")
-            
-            # Удаляем теги из текста ответа
-            cleaned_response = re.sub(b64file_pattern, '', response)
-            history.append({"role": "assistant", "content": cleaned_response.strip()})
-            
-            # Обрабатываем каждый маркер
             for file_path in b64file_matches:
                 try:
-                    # Проверяем наличие файла
                     if not os.path.exists(file_path):
                         logger.error(f"Файл не найден: {file_path}")
-                        # Добавляем текстовое сообщение об ошибке вместо отсутствующего изображения
-                        history.append({"role": "assistant", "content": f"Ошибка: Изображение не найдено ({file_path})"})
+                        assistant_response_html += f"<div>Ошибка: Изображение не найдено ({file_path})</div>"
                         continue
-                    
-                    # Стандартизируем путь к файлу для совместимости с разными ОС
-                    normalized_path = os.path.normpath(file_path)
-                    logger.info(f"Normalized path: {normalized_path}")
-                    
-                    # Читаем данные base64 из файла
-                    with open(normalized_path, 'r') as f:
+
+                    with open(file_path, 'r') as f:
                         file_content = f.read().strip()
-                    
-                    logger.info(f"Успешно прочитан файл base64: {file_path} (длина: {len(file_content)} символов)")
-                    
-                    # Добавляем префикс, если его нет, т.к. он необходим для Gradio
+
                     if not file_content.startswith('data:image/png;base64,'):
-                        base64_only = f"data:image/png;base64,{file_content}"
-                        logger.info(f"Добавлен префикс 'data:image/png;base64,' к данным изображения")
+                        base64_data = f"data:image/png;base64,{file_content}"
                     else:
-                        base64_only = file_content
-                        logger.info(f"Данные изображения уже с префиксом data:image/png;base64,")
-                    
-                    logger.info(f"Подготовлены данные изображения с правильным форматом (длина: {len(base64_only)})")
-                    logger.info(f"Добавляем изображение в историю чата")
-                    logger.info(base64_only)
-                    # Добавляем как изображение в историю чата
-                    # Для Gradio Chatbot необходимо указать пустую строку вместо None для поля content
-                    img = "<img src='" + base64_only + "' alt='Image'>"
-                    history.append({"role": "assistant", "content": img})
-                    logger.info(f"Добавлено изображение в чат (base64 данные длиной: {len(base64_only)})")
+                        base64_data = file_content
+
+                    assistant_response_html += f"<img src='{base64_data}' alt='Image' style='max-width: 100%; height: auto;'>"
                 except Exception as img_err:
                     logger.error(f"Ошибка при обработке base64 файла {file_path}: {str(img_err)}")
-        else:
-            logger.info(f"Добавляем ответ как текст, есть проблема с изображением")
-            # Если нет маркеров, просто добавляем ответ как текст
-            history.append({"role": "assistant", "content": response})
+                    assistant_response_html += f"<div>Ошибка при загрузке изображения: {file_path}</div>"
+
+        # Добавляем пару [вопрос, ответ] в историю
+        history.append([message, assistant_response_html])
         
         # Ограничиваем длину истории
-        if len(history) > MAX_HISTORY_LENGTH * 2:  # Умножаем на 2, так как каждая пара вопрос-ответ - это 2 элемента
-            removed_count = len(history) - MAX_HISTORY_LENGTH * 2
-            history = history[-MAX_HISTORY_LENGTH * 2:]
-            logger.debug(f"История чата обрезана. Удалено {removed_count} старых сообщений")
-        logger.info(f"История чата: {history}")
-        logger.info(f"Источники: {sources_html}")
+        if len(history) > MAX_HISTORY_LENGTH:
+            history = history[-MAX_HISTORY_LENGTH:]
+            logger.debug(f"История чата обрезана до {MAX_HISTORY_LENGTH} последних сообщений")
+
         # Очищаем директорию с изображениями после ответа
         clean_static_images()
-        
+        logger.info(f"Директория с изображениями очищена")
+
+        # Сохраняем диалог в базу данных
+        memory_storage.add_message(session_id, message, response, sources) # Сохраняем оригинальный ответ с источниками
+        logger.info(f"Диалог сохранен в базу данных")
+
         # Возвращаем ответ и обновляем историю
-        return "", history, sources_html
+        return "", history, sources_html, session_state
     
     except Exception as e:
         error_msg = f"Ошибка при обработке запроса: {str(e)}"
         logger.error(error_msg, exc_info=True)
         history.append({"role": "assistant", "content": "Извините, произошла ошибка при обработке вашего запроса."})
-        return "", history, ""
+        return "", history, "", session_state
 
 # Функции для работы с Oracle Text2SQL
 oracle_tool = None
@@ -358,15 +365,17 @@ def format_results_as_html(results):
 
 
 def clear_chat():
-    """Очищает историю чата и возвращает пустые значения для всех элементов"""
-    logger.info("Очистка истории чата")
+    """Очищает историю чата и возвращает пустые значения для всех элементов, включая состояние сессии"""
+    logger.info("Очистка истории чата и состояния сессии")
     
     # Сбрасываем глобальный run_id при очистке чата
     global LAST_RUN_ID
     LAST_RUN_ID = None
     logger.info("Сброс LAST_RUN_ID при очистке чата")
     
-    return [], "", ""  # Пустые значения для chat_history, sources_display, feedback_status
+    # Возвращаем пустые значения для всех элементов, включая состояние сессии
+    # chatbot, sources_display, feedback_status, session_state
+    return [], "", "", {}
 
 def submit_feedback(rating, comments, history):
     """Отправляет обратную связь о последнем ответе и отправляет её в LangSmith"""
@@ -402,213 +411,125 @@ def submit_feedback(rating, comments, history):
         else:
             logger.error("Не удалось сохранить отзыв")
             return "Не удалось сохранить отзыв. Пожалуйста, попробуйте позже."
-    
+            
     except Exception as e:
         logger.error(f"Ошибка при сохранении отзыва: {str(e)}", exc_info=True)
         return "Произошла ошибка при сохранении отзыва. Пожалуйста, попробуйте позже."
 
-def create_demo(rag_assistant):
+
+def create_demo(rag_assistant_instance):
     """Создает демонстрационный интерфейс Gradio"""
     # Создаем псевдоним для удобства доступа к ассистенту
-    assistant = rag_assistant.assistant
+    assistant = rag_assistant_instance.assistant
     with gr.Blocks(css="footer {visibility: hidden}") as demo:
-        gr.Markdown("# 🔍 Система вопросов и ответов с гибридным поиском")        
+        session_state = gr.State({})
+        gr.Markdown("# 🔍 Система вопросов и ответов с гибридным поиском")
         
-        # Создаем вкладки для основного интерфейса и настроек
-        with gr.Tabs() as tabs:
-            with gr.TabItem("Чат") as chat_tab:
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        chatbot = gr.Chatbot(
-                            height=500, 
-                            label="Диалог",
-                            type="messages"  # Using the new messages format
-                        )
-                        msg = gr.Textbox(
-                            placeholder="Введите ваш вопрос...",
-                            label="Вопрос",
-                            lines=1
-                        )
-                        with gr.Row():
-                            submit_btn = gr.Button("Отправить", variant="primary")
-                            clear_btn = gr.Button("Очистить")
-                    
-                    with gr.Column(scale=2):
-                        sources_display = gr.HTML(label="Источники")
-                        with gr.Group():  # Replaced Box with Group
-                            gr.Markdown("### Оцените ответ")
-                            with gr.Row():
-                                rating = gr.Slider(
-                                    minimum=1, 
-                                    maximum=5, 
-                                    step=1, 
-                                    value=3, 
-                                    label="Оценка"
-                                )
-                            comments = gr.Textbox(
-                                placeholder="Дополнительные комментарии...", 
-                                label="Комментарии"
-                            )
-                            feedback_btn = gr.Button("Отправить отзыв")
-                            feedback_status = gr.Markdown()
-            # Добавляем вкладку "Настройки модели"
-            
-            with gr.TabItem("Настройки модели") as settings_tab:
-                with gr.Group():
-                    gr.Markdown("### Выбор модели")
+        with gr.Tab("Основной чат"):
+            with gr.Row():
+                with gr.Column(scale=4):
+                    chatbot = gr.Chatbot(
+                        [],
+                        elem_id="chatbot",
+                        bubble_full_width=False,
+                        avatar_images=(None, (os.path.join(os.path.dirname(__file__), "images/avatar.png"))),
+                        height=600
+                    )
                     with gr.Row():
-                        model_type = gr.Dropdown(
-                            choices=["local", "openai"],
-                            value=assistant.model_type,
-                            label="Тип модели",
-                            info="Локальная или OpenAI"
-                        )
+                        msg = gr.Textbox(show_label=False, placeholder="Введите ваш вопрос и нажмите Enter", container=False, scale=8)
+                        submit_btn = gr.Button("Отправить", scale=1)
                     
-                    # Создаем обновляемый список моделей
-                    local_models = assistant.AVAILABLE_MODELS[assistant.MODEL_TYPE_LOCAL]
-                    openai_models = assistant.AVAILABLE_MODELS[assistant.MODEL_TYPE_OPENAI]
-                    
-                    # Сначала показываем модели текущего типа
-                    current_models = local_models if assistant.model_type == "local" else openai_models
-                    
-                    model_name = gr.Dropdown(
-                        choices=current_models,
-                        value=assistant.model_name,
-                        label="Модель",
-                        info="Доступные модели выбранного типа"
-                    )
-                    
-                    # Функция для обновления списка моделей при смене типа
-                    def update_model_list(selected_type):
-                        if selected_type == "local":
-                            return gr.update(choices=local_models, value=local_models[0])
-                        else:
-                            return gr.update(choices=openai_models, value=openai_models[0])
-                    
-                    # Связываем изменение типа модели с обновлением списка моделей
-                    model_type.change(update_model_list, inputs=[model_type], outputs=[model_name])
-                    
-                    gr.Markdown("### Параметры модели")
-                    temperature = gr.Slider(
-                        minimum=0.01,
-                        maximum=1.0,
-                        step=0.01,
-                        value=assistant.model_params["temperature"],
-                        label="Temperature",
-                        info="Чем выше значение, тем более творческие ответы"
-                    )
-                    max_tokens = gr.Slider(
-                        minimum=16,
-                        maximum=4096,
-                        step=16,
-                        value=assistant.model_params["max_tokens"],
-                        label="Max Tokens",
-                        info="Максимальная длина вывода модели"
-                    )
-                    top_p = gr.Slider(
-                        minimum=0.1,
-                        maximum=1.0,
-                        step=0.05,
-                        value=assistant.model_params["top_p"],
-                        label="Top P",
-                        info="Параметр для нуклеусной выборки"
-                    )
-                    n_ctx = gr.Slider(
-                        minimum=512,
-                        maximum=4096,
-                        step=512,
-                        value=assistant.model_params["n_ctx"],
-                        label="Контекст",
-                        info="Размер контекстного окна"
-                    )
-                    n_threads = gr.Slider(
-                        minimum=1,
-                        maximum=12,
-                        step=1,
-                        value=assistant.model_params["n_threads"],
-                        label="Потоки",
-                        info="Количество потоков CPU"
-                    )
-                    n_gpu_layers = gr.Slider(
-                        minimum=0,
-                        maximum=32,
-                        step=1,
-                        value=assistant.model_params["n_gpu_layers"],
-                        label="GPU слои",
-                        info="Количество слоев для GPU"
-                    )
-                    verbose = gr.Checkbox(
-                        value=assistant.model_params["verbose"],
-                        label="Подробный режим",
-                        info="Включает подробный вывод процесса генерации"
-                    )
-                    settings_submit_btn = gr.Button("Сохранить настройки", variant="primary")
-                    settings_status = gr.Markdown()
-
-        # Мостик для перехода между вкладками
-        def change_tab_to_settings():
-            return gr.update(selected="Настройки модели")
-        
-        # Функция для обновления настроек модели
-        def update_model_settings(model_type_val, model_name_val, temp, max_tok, top_p_val, ctx, threads, gpu_layers, verb):
-            try:
-                # Обновляем настройки модели включая тип и название модели
-                success = rag_assistant.assistant.update_model_params(
-                    model_type=model_type_val,
-                    model_name=model_name_val,
-                    temperature=temp,
-                    max_tokens=max_tok,
-                    top_p=top_p_val,
-                    n_ctx=ctx,
-                    n_threads=threads,
-                    n_gpu_layers=gpu_layers,
-                    verbose=verb
-                )
+                    with gr.Row():
+                        clear_btn = gr.Button("Очистить чат")
                 
-                if success:
-                    return "✅ Настройки модели успешно обновлены"
-                else:
-                    return "❌ Не удалось обновить настройки модели"
-            except Exception as e:
-                return f"❌ Ошибка: {str(e)}"
+                with gr.Column(scale=2):
+                    sources_display = gr.HTML("Источники будут отображены здесь", elem_id="sources")
+                    
+                    with gr.Accordion("Обратная связь", open=False):
+                        feedback_rating = gr.Radio(["👍", "👎"], label="Оцените ответ")
+                        feedback_comments = gr.Textbox(label="Комментарии (опционально)")
+                        feedback_btn = gr.Button("Отправить отзыв")
+                        feedback_status = gr.Textbox(label="Статус отзыва", interactive=False)
+
+        with gr.Tab("Настройки модели"):
+            gr.Markdown("## Настройки Oracle Text2SQL")
+            
+            with gr.Row():
+                model_type_dropdown = gr.Dropdown(
+                    ["openai", "local"], 
+                    label="Тип модели", 
+                    value="openai"
+                )
+                model_name_textbox = gr.Textbox(
+                    label="Название модели", 
+                    value="gpt-4-turbo-preview"
+                )
+                init_oracle_btn = gr.Button("Инициализировать Oracle")
+            
+            oracle_init_status = gr.Textbox(label="Статус инициализации Oracle", interactive=False)
+            
+            gr.Markdown("### Информация о схеме БД")
+            with gr.Row():
+                schema_tables_textbox = gr.Textbox(label="Таблицы (через запятую, опционально)")
+                get_schema_btn = gr.Button("Получить схему")
+            
+            schema_display = gr.Textbox(label="Схема БД", lines=10, interactive=False)
+            
+            gr.Markdown("### Выполнение Text2SQL запроса")
+            with gr.Row():
+                text2sql_query_textbox = gr.Textbox(label="Запрос на естественном языке")
+                text2sql_tables_textbox = gr.Textbox(label="Таблицы для запроса (опционально)")
+            
+            execute_sql_checkbox = gr.Checkbox(label="Выполнить SQL запрос", value=True)
+            process_text2sql_btn = gr.Button("Выполнить Text2SQL")
+            
+            sql_display = gr.Textbox(label="Сгенерированный SQL", lines=5, interactive=False)
+            results_display = gr.HTML(label="Результаты запроса")
+            text2sql_status = gr.Textbox(label="Статус выполнения", interactive=False)
+
+        # Обработчики для вкладки "Настройки модели"
+        init_oracle_btn.click(
+            initialize_oracle_tool, 
+            inputs=[model_type_dropdown, model_name_textbox], 
+            outputs=oracle_init_status
+        )
         
-        # Функция для изменения вкладки
-        def select_tab_settings():
-            return gr.update(selected="Настройки модели")
+        get_schema_btn.click(
+            get_schema_info, 
+            inputs=[schema_tables_textbox], 
+            outputs=schema_display
+        )
         
+        process_text2sql_btn.click(
+            process_text2sql_query, 
+            inputs=[text2sql_query_textbox, text2sql_tables_textbox, execute_sql_checkbox], 
+            outputs=[sql_display, results_display, text2sql_status]
+        )
+
+        # Определяем входы и выходы для чат-функции
+        chat_inputs = [msg, chatbot, session_state]
+        chat_outputs = [msg, chatbot, sources_display, session_state]
+
         # Обработчики событий
-        submit_btn.click(
-            chat_with_feedback, 
-            inputs=[msg, chatbot], 
-            outputs=[msg, chatbot, sources_display]
-        )
+        submit_btn.click(chat_with_feedback, inputs=chat_inputs, outputs=chat_outputs)
+        msg.submit(chat_with_feedback, inputs=chat_inputs, outputs=chat_outputs)
         
-        msg.submit(
-            chat_with_feedback, 
-            inputs=[msg, chatbot], 
-            outputs=[msg, chatbot, sources_display]
-        )
-        
-        clear_btn.click(
-            clear_chat, 
-            outputs=[chatbot, sources_display, feedback_status]
-        )
+        # Кнопка очистки теперь также сбрасывает состояние сессии
+        clear_btn.click(clear_chat, outputs=[chatbot, sources_display, feedback_status, session_state])
         
         feedback_btn.click(
             submit_feedback,
-            inputs=[rating, comments, chatbot],
-            outputs=[feedback_status]
+            inputs=[feedback_rating, feedback_comments, chatbot],
+            outputs=feedback_status
         )
-                    
-        settings_submit_btn.click(
-            update_model_settings,
-            inputs=[model_type, model_name, temperature, max_tokens, top_p, n_ctx, n_threads, n_gpu_layers, verbose],
-            outputs=[settings_status]
-        )
-        
+
         # Инициализируем Oracle Text2SQL при запуске приложения 
-        # для использования в качестве инструмента агента
-        
+        # (используем модель по умолчанию)
+        demo.load(
+            lambda: initialize_oracle_tool("openai", "gpt-4-turbo-preview"),
+            outputs=gr.Textbox(visible=False)  # Скрытый выход для статуса
+        )
+
     return demo
 
 def get_embeddings_with_prefix(texts, task="search_query"):

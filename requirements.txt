@@ -40,4 +40,5 @@ torch
 transformers
 rank_bm25
 oracledb
+psycopg2-binary
 ipython
