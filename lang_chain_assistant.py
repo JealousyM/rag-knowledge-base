@@ -36,13 +36,20 @@ class LangChainAssistant:
         "n_gpu_layers": 0
     }
     
-    def __init__(self, model_type: str = MODEL_TYPE_OPENAI, model_name: str = "gpt-3.5-turbo"):
-        # Устанавливаем тип модели (локальная или OpenAI)
-        self.model_type = model_type
-        
-        # По умолчанию теперь используется OpenAI gpt-3.5-turbo
-        self.model_name = model_name
-        
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        # Set default values first
+        self.model_type = self.MODEL_TYPE_OPENAI
+        self.model_name = "gpt-3.5-turbo"
+
+        # If a config is provided, update parameters
+        if config:
+            self.model_type = config.get('model_type', self.model_type)
+            self.model_name = config.get('model_name', self.model_name)
+            # Update model_params with any overrides from config
+            for key in self.model_params:
+                if key in config:
+                    self.model_params[key] = config[key]
+
         self.llm = None
         self._load_model()
         logger.info(f"Инициализирован LangChain ассистент с моделью: {self.model_name}, тип: {self.model_type}")
@@ -173,6 +180,15 @@ class LangChainAssistant:
         # Добавляем приглашение для модели
         formatted.append("<|im_start|>assistant\n")
         return "\n".join(formatted)
+
+    def get_config(self) -> Dict[str, Any]:
+        """Returns the current model configuration."""
+        config = {
+            "model_type": self.model_type,
+            "model_name": self.model_name,
+        }
+        config.update(self.model_params)
+        return config
         
     def update_model_params(self, **kwargs):
         """Обновляет параметры модели и перезагружает её

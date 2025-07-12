@@ -58,6 +58,14 @@ class MemoryStorage:
                         timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
+                
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS llm_configurations (
+                        id INT PRIMARY KEY,
+                        config_data JSONB NOT NULL,
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
                 self.conn.commit()
 
                 # Check if 'sources' column exists and add it if not
@@ -136,3 +144,37 @@ class MemoryStorage:
             if self.conn:
                 self.conn.close()
         return history
+
+    def save_llm_configuration(self, config_data):
+        """Save or update the LLM configuration."""
+        try:
+            self.connect()
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO llm_configurations (id, config_data, updated_at)
+                    VALUES (1, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (id) DO UPDATE
+                    SET config_data = EXCLUDED.config_data, updated_at = CURRENT_TIMESTAMP;
+                """, (json.dumps(config_data),))
+                self.conn.commit()
+        except psycopg2.Error as e:
+            print(f"Error saving LLM configuration: {e}")
+        finally:
+            if self.conn:
+                self.conn.close()
+
+    def load_llm_configuration(self):
+        """Load the LLM configuration."""
+        try:
+            self.connect()
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT config_data FROM llm_configurations WHERE id = 1;")
+                result = cur.fetchone()
+                if result:
+                    return result[0]
+        except psycopg2.Error as e:
+            print(f"Error loading LLM configuration: {e}")
+        finally:
+            if self.conn:
+                self.conn.close()
+        return None

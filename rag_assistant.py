@@ -42,9 +42,10 @@ class RAGAssistant:
     Интегрирует гибридный поиск и LLM для ответов на вопросы
     """
     
-    def __init__(self, load_model=True):
+    def __init__(self, memory_storage, load_model=True):
         logger.info("Инициализация RAGAssistant с ReAct агентами...")
         self.assistant = None
+        self.memory_storage = memory_storage
         self.llm = None
         self.oracle_tool = None
         self.tools = []
@@ -60,11 +61,24 @@ class RAGAssistant:
             # Инициализируем компоненты для поиска
             self.search_engine = HybridSearch()
             logger.info("Инициализирован поисковый движок для RAG")
+
+            # Загружаем конфигурацию LLM из БД
+            logger.info("Loading LLM configuration from database...")
+            llm_config = self.memory_storage.load_llm_configuration()
+            if llm_config:
+                logger.info(f"Loaded config: {llm_config}")
+            else:
+                logger.info("No config found in DB, using defaults.")
             
-            # Загружаем основную LLM модель
+            # Загружаем основную LLM модель с конфигурацией
             logger.info("Загрузка LLM модели...")
-            self.assistant = LangChainAssistant()
+            self.assistant = LangChainAssistant(config=llm_config)
             self.llm = self.assistant.llm  # получаем ChatOpenAI или LlamaCpp
+
+            # Если конфига не было в БД, сохраняем текущий (дефолтный)
+            if not llm_config:
+                self.memory_storage.save_llm_configuration(self.assistant.get_config())
+                logger.info("Default LLM configuration saved to database.")
             model_class_name = type(self.llm).__name__
             logger.info(f"LLM успешно загружен: {model_class_name}")
             
@@ -145,6 +159,49 @@ class RAGAssistant:
             logger.error(f"Ошибка при инициализации RAGAssistant: {str(e)}", exc_info=True)
             raise
             
+    def get_llm_config(self):
+        """Get the current LLM configuration from the assistant."""
+        if self.assistant:
+            return self.assistant.get_config()
+        return {}
+
+    def update_llm_config(self, model_type, model_name, temperature, top_p, max_tokens, model_path):
+        """Update the LLM configuration, save it, and re-initialize dependent components."""
+        try:
+            config_data = {
+                'model_type': model_type,
+                'model_name': model_name,
+                'temperature': float(temperature),
+                'top_p': float(top_p),
+                'max_tokens': int(max_tokens),
+                'model_path': model_path
+            }
+            logger.info(f"Updating LLM config with: {config_data}")
+
+            # 1. Update params in LangChainAssistant (this also reloads the model)
+            success = self.assistant.update_model_params(**config_data)
+            if not success:
+                raise Exception("Failed to update model parameters in LangChainAssistant.")
+
+            # 2. Get the new full configuration
+            new_config = self.assistant.get_config()
+            logger.info(f"New full config: {new_config}")
+
+            # 3. Save the new configuration to the database
+            self.memory_storage.save_llm_configuration(new_config)
+            logger.info("LLM configuration saved to database.")
+
+            # 4. Re-initialize the main LLM and agents in RAGAssistant
+            self.llm = self.assistant.llm
+            self._initialize_agents() # Agents depend on the LLM instance
+            self.graph = self._create_rag_graph()
+            logger.info("RAGAssistant components re-initialized with new LLM config.")
+
+            return f"Configuration updated successfully."
+        except Exception as e:
+            logger.error(f"Error updating LLM config: {e}", exc_info=True)
+            return f"Error updating configuration: {e}"
+
     def _convert_tools_to_openai_functions(self, tools):
         """Преобразует инструменты в формат функций OpenAI"""
         from langchain.tools.convert_to_openai import convert_to_openai_function
@@ -1228,7 +1285,7 @@ class RAGAssistant:
             ]
             is_graph_request = any(keyword.lower() in query.lower() for keyword in show_graph_keywords)
             
-            # Если запрос явно о графе, принудительно использовать общий агент с show_graph_tool
+            # Если запрос явно о графе, принудительно используем общий агент с show_graph_tool
             if is_graph_request:
                 logger.info("Обнаружен запрос на визуализацию графа системы, принудительное использование show_graph_tool")
                 route = "graph"  # Принудительно используем общий агент

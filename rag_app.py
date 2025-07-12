@@ -10,11 +10,17 @@ from qdrant_client import QdrantClient
 from text_utils import format_source_display
 from file_utils import clean_static_images
 from memory_storage import MemoryStorage
-# Импорт класса для работы с Oracle Text2SQL
+from rag_assistant import RAGAssistant
+from lang_chain_assistant import LangChainAssistant
 from oracle_text2sql import OracleText2SQL
 from constants import *
 
-from rag_assistant import RAGAssistant
+def update_model_choices(model_type):
+    """Обновляет список доступных моделей при смене типа модели."""
+    choices = LangChainAssistant.AVAILABLE_MODELS.get(model_type, [])
+    # Устанавливаем значение по умолчанию на первое в списке, если список не пуст
+    default_value = choices[0] if choices else None
+    return gr.Dropdown.update(choices=choices, value=default_value)
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -57,37 +63,22 @@ def chat_with_feedback(message, history, session_state):
         session_state["session_id"] = session_id
 
     try:
-        # Сначала проверяем кэш
+        # Add the user's message to the history immediately
+        history.append({"role": "user", "content": message})
+
+        # Now, check the cache
         cached_answer, cached_sources = memory_storage.get_exact_answer(session_id, message)
         if cached_answer:
             logger.info("Найден точный ответ в кэше.")
             sources_html = format_source_display(cached_sources)
-            history.append([message, cached_answer])
+            # User message is already in history, just add assistant's response
+            history.append({"role": "assistant", "content": cached_answer})
             return "", history, sources_html, session_state
 
-        # Получаем историю из базы данных
-        db_history = memory_storage.get_conversation_history(session_id)
-        logger.info(f"Retrieved {len(db_history)} messages from long-term memory for session {session_id}.")
 
-        # Преобразуем историю в формат для ассистента
-        # Ожидаемый формат: [[user_msg1, assistant_msg1], [user_msg2, assistant_msg2], ...]
-        # Сначала берем историю из БД, затем добавляем текущую историю из Gradio
-        chat_history = db_history
-        if history:
-            for i, item in enumerate(history):
-                # Если это словари, используем их content
-                if isinstance(item, dict) and "role" in item and "content" in item:
-                    if item["role"] == "user":
-                        # Добавляем только если это пользовательское сообщение
-                        # и следующее сообщение от ассистента
-                        if i + 1 < len(history) and isinstance(history[i+1], dict) and history[i+1]["role"] == "assistant":
-                            chat_history.append([item["content"], history[i+1]["content"]])
-                # Если это кортежи, используем их напрямую
-                elif isinstance(item, tuple) and len(item) == 2:
-                    chat_history.append([item[0], item[1]])
-        
-        # Генерируем ответ, используя метод answer_query
-        response, sources, run_id = rag_assistant.answer_query(message, chat_history)
+
+        # Pass the complete, correct history to the assistant
+        response, sources, run_id = rag_assistant.answer_query(message, history)
         logger.info(f"Ответ: {response}")
         logger.info(f"Источники: {sources}")
         logger.info(f"ID запроса: {run_id}")
@@ -132,8 +123,8 @@ def chat_with_feedback(message, history, session_state):
                     logger.error(f"Ошибка при обработке base64 файла {file_path}: {str(img_err)}")
                     assistant_response_html += f"<div>Ошибка при загрузке изображения: {file_path}</div>"
 
-        # Добавляем пару [вопрос, ответ] в историю
-        history.append([message, assistant_response_html])
+        # Append the final assistant response to the history
+        history.append({"role": "assistant", "content": assistant_response_html})
         
         # Ограничиваем длину истории
         if len(history) > MAX_HISTORY_LENGTH:
@@ -417,10 +408,18 @@ def submit_feedback(rating, comments, history):
         return "Произошла ошибка при сохранении отзыва. Пожалуйста, попробуйте позже."
 
 
-def create_demo(rag_assistant_instance):
-    """Создает демонстрационный интерфейс Gradio"""
-    # Создаем псевдоним для удобства доступа к ассистенту
-    assistant = rag_assistant_instance.assistant
+def create_demo(rag_assistant, memory_storage):
+    """
+    Создает демонстрационный интерфейс Gradio
+    
+    Args:
+        rag_assistant: Экземпляр RAGAssistant
+        memory_storage: Экземпляр MemoryStorage
+    """
+    # Загружаем текущую конфигурацию LLM при запуске
+    current_config = rag_assistant.get_llm_config()
+    logger.info(f"Загружена конфигурация LLM для UI: {current_config}")
+    
     with gr.Blocks(css="footer {visibility: hidden}") as demo:
         session_state = gr.State({})
         gr.Markdown("# 🔍 Система вопросов и ответов с гибридным поиском")
@@ -431,7 +430,7 @@ def create_demo(rag_assistant_instance):
                     chatbot = gr.Chatbot(
                         [],
                         elem_id="chatbot",
-                        bubble_full_width=False,
+                        type="messages",
                         avatar_images=(None, (os.path.join(os.path.dirname(__file__), "images/avatar.png"))),
                         height=600
                     )
@@ -452,19 +451,31 @@ def create_demo(rag_assistant_instance):
                         feedback_status = gr.Textbox(label="Статус отзыва", interactive=False)
 
         with gr.Tab("Настройки модели"):
-            gr.Markdown("## Настройки Oracle Text2SQL")
-            
+            gr.Markdown("Здесь можно настроить параметры языковой модели.")
             with gr.Row():
-                model_type_dropdown = gr.Dropdown(
-                    ["openai", "local"], 
+                model_type_dd = gr.Dropdown(
                     label="Тип модели", 
-                    value="openai"
+                    choices=list(LangChainAssistant.AVAILABLE_MODELS.keys()), 
+                    value=current_config.get('model_type', 'openai'),
+                    interactive=True
                 )
-                model_name_textbox = gr.Textbox(
+                # Динамически устанавливаем список доступных моделей и выбранное значение
+                available_models_for_type = LangChainAssistant.AVAILABLE_MODELS.get(current_config.get('model_type', 'openai'), [])
+                model_name_dd = gr.Dropdown(
                     label="Название модели", 
-                    value="gpt-4-turbo-preview"
+                    choices=available_models_for_type, 
+                    value=current_config.get('model_name', 'gpt-3.5-turbo'),
+                    interactive=True
                 )
-                init_oracle_btn = gr.Button("Инициализировать Oracle")
+            temperature_slider = gr.Slider(minimum=0.0, maximum=2.0, value=current_config.get('temperature', 0.7), step=0.1, label="Температура", interactive=True)
+            top_p_slider = gr.Slider(minimum=0.0, maximum=1.0, value=current_config.get('top_p', 1.0), step=0.1, label="Top-P", interactive=True)
+            max_tokens_slider = gr.Slider(minimum=1, maximum=4096, value=current_config.get('max_tokens', 1024), step=1, label="Макс. токены", interactive=True)
+            model_path_tb = gr.Textbox(label="Путь к модели (для локальных моделей)", value=current_config.get('model_path', ''), interactive=True)
+            save_settings_btn = gr.Button("Сохранить настройки")
+            settings_status_md = gr.Markdown()
+
+            # Динамическое обновление списка моделей
+            model_type_dd.change(fn=update_model_choices, inputs=model_type_dd, outputs=model_name_dd)
             
             oracle_init_status = gr.Textbox(label="Статус инициализации Oracle", interactive=False)
             
@@ -487,13 +498,13 @@ def create_demo(rag_assistant_instance):
             results_display = gr.HTML(label="Результаты запроса")
             text2sql_status = gr.Textbox(label="Статус выполнения", interactive=False)
 
-        # Обработчики для вкладки "Настройки модели"
-        init_oracle_btn.click(
-            initialize_oracle_tool, 
-            inputs=[model_type_dropdown, model_name_textbox], 
-            outputs=oracle_init_status
+        # Обработчик для кнопки сохранения настроек
+        save_settings_btn.click(
+            fn=rag_assistant.update_llm_config,
+            inputs=[model_type_dd, model_name_dd, temperature_slider, top_p_slider, max_tokens_slider, model_path_tb],
+            outputs=[settings_status_md]
         )
-        
+
         get_schema_btn.click(
             get_schema_info, 
             inputs=[schema_tables_textbox], 
@@ -506,13 +517,15 @@ def create_demo(rag_assistant_instance):
             outputs=[sql_display, results_display, text2sql_status]
         )
 
-        # Определяем входы и выходы для чат-функции
-        chat_inputs = [msg, chatbot, session_state]
-        chat_outputs = [msg, chatbot, sources_display, session_state]
-
         # Обработчики событий
-        submit_btn.click(chat_with_feedback, inputs=chat_inputs, outputs=chat_outputs)
-        msg.submit(chat_with_feedback, inputs=chat_inputs, outputs=chat_outputs)
+        # The user's message is the first input, and the history is the second.
+        # The history is updated and returned to the chatbot component.
+        submit_btn.click(chat_with_feedback, 
+                         inputs=[msg, chatbot, session_state], 
+                         outputs=[msg, chatbot, sources_display, session_state])
+        msg.submit(chat_with_feedback, 
+                   inputs=[msg, chatbot, session_state], 
+                   outputs=[msg, chatbot, sources_display, session_state])
         
         # Кнопка очистки теперь также сбрасывает состояние сессии
         clear_btn.click(clear_chat, outputs=[chatbot, sources_display, feedback_status, session_state])
@@ -521,13 +534,6 @@ def create_demo(rag_assistant_instance):
             submit_feedback,
             inputs=[feedback_rating, feedback_comments, chatbot],
             outputs=feedback_status
-        )
-
-        # Инициализируем Oracle Text2SQL при запуске приложения 
-        # (используем модель по умолчанию)
-        demo.load(
-            lambda: initialize_oracle_tool("openai", "gpt-4-turbo-preview"),
-            outputs=gr.Textbox(visible=False)  # Скрытый выход для статуса
         )
 
     return demo
@@ -669,16 +675,19 @@ if __name__ == "__main__":
         logger.info(f"Успешное подключение к коллекции {COLLECTION_NAME}")
         
         # Инициализация RAG-ассистента
-        rag_assistant = RAGAssistant()
+        rag_assistant = RAGAssistant(memory_storage=memory_storage)
+
+        # Инициализируем Oracle Text2SQL до запуска интерфейса
+        logger.info("Initializing Oracle Text2SQL tool...")
+        oracle_init_status = initialize_oracle_tool("openai", "gpt-4-turbo-preview")
+        logger.info(f"Oracle Text2SQL status: {oracle_init_status}")
         
-        # Примечание: RAGAssistant сам создает HybridSearch внутри
-        
-        # Создаем экземпляр демонстрации
-        demo = create_demo(rag_assistant)
-        
-        # Запуск Gradio интерфейса с поддержкой статических файлов
-        # Используем другой порт, так как 7862 может быть занят
-        demo.launch(server_port=7862, server_name="0.0.0.0", share=False, allowed_paths=["./static"])
+        # Создаем и запускаем Gradio интерфейс
+        demo = create_demo(rag_assistant, memory_storage)
+
+        # Запуск Gradio приложения
+        logger.info("Запуск Gradio интерфейса...")
+        demo.queue().launch(share=True, server_name="0.0.0.0", server_port=7860, debug=True)
     
     except Exception as e:
         logger.error(f"Ошибка при запуске приложения: {str(e)}")
