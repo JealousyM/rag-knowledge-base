@@ -5,6 +5,7 @@ from langchain.schema import Document
 from langchain.retrievers import BM25Retriever, EnsembleRetriever
 from langchain.vectorstores import Qdrant
 from data_processing import RoSBERTaEmbeddings, Config, EMBEDDING_MODEL
+from reranker import DocumentReranker, HybridReranker
 import logging
 import time
 
@@ -17,14 +18,34 @@ logger = logging.getLogger(__name__)
 class HybridSearch:
     """Класс для выполнения гибридного поиска с использованием LangChain EnsembleRetriever"""
     
-    def __init__(self, collection_name: str = COLLECTION_NAME):
+    def __init__(self, collection_name: str = COLLECTION_NAME, enable_reranking: bool = True, reranker_type: str = "cross_encoder"):
         """
         Инициализация гибридного поиска с использованием LangChain
         
         Args:
             collection_name: Имя коллекции в Qdrant
+            enable_reranking: Включить ли реранжирование результатов
+            reranker_type: Тип реранкера ("cross_encoder" или "hybrid")
         """
         self.client = QdrantClient(host=Config.QDRANT_HOST, port=Config.QDRANT_PORT)
+        self.enable_reranking = enable_reranking
+        
+        # Инициализация реранкера
+        self.reranker = None
+        if enable_reranking:
+            try:
+                if reranker_type == "cross_encoder":
+                    self.reranker = DocumentReranker()
+                elif reranker_type == "hybrid":
+                    self.reranker = HybridReranker()
+                else:
+                    logger.warning(f"Unknown reranker type: {reranker_type}, disabling reranking")
+                    self.enable_reranking = False
+                logger.info(f"Reranker initialized: {reranker_type}")
+            except Exception as e:
+                logger.error(f"Failed to initialize reranker: {str(e)}, disabling reranking")
+                self.enable_reranking = False
+                self.reranker = None
         
         # Инициализируем обертку эмбеддингов для LangChain
         self.embeddings = RoSBERTaEmbeddings(EMBEDDING_MODEL)
@@ -146,13 +167,14 @@ class HybridSearch:
             logger.error(f"Ошибка при инициализации поиска: {str(e)}")
             raise
     
-    def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+    def search(self, query: str, k: int = 5, rerank_top_k: int = None) -> List[Document]:
         """
-        Выполняет гибридный поиск, используя LangChain EnsembleRetriever
+        Выполняет гибридный поиск, используя LangChain EnsembleRetriever с опциональным реранжированием
         
         Args:
             query: Поисковый запрос
-            k: Количество результатов
+            k: Количество результатов для возврата
+            rerank_top_k: Количество документов для реранжирования (если None, используется k*2)
             
         Returns:
             Список релевантных документов с метаданными и оценками
@@ -239,9 +261,34 @@ class HybridSearch:
                         logger.error(f"Ошибка при прямом поиске через Qdrant: {str(qdrant_error)}")
                         results = []
             
+            # Применяем реранжирование, если включено
+            if self.enable_reranking and self.reranker and results:
+                # Определяем количество документов для реранжирования
+                if rerank_top_k is None:
+                    rerank_top_k = min(k * 2, len(results))  # Реранжируем в 2 раза больше документов
+                
+                # Берем больше документов для реранжирования
+                docs_to_rerank = results[:rerank_top_k]
+                
+                logger.info(f"Применяем реранжирование к {len(docs_to_rerank)} документам")
+                
+                # Применяем реранжирование
+                if hasattr(self.reranker, 'rerank_documents'):
+                    reranked_docs = self.reranker.rerank_documents(query, docs_to_rerank, top_k=k)
+                else:
+                    # Fallback для простого реранкера
+                    reranked_docs = docs_to_rerank[:k]
+                
+                # Используем реранжированные результаты
+                results = reranked_docs
+                logger.info(f"Реранжирование завершено, возвращаем {len(results)} документов")
+            else:
+                # Если реранжирование отключено, просто берем топ-k
+                results = results[:k]
+            
             # Преобразуем результаты в формат, совместимый с предыдущей версией
             processed_results = []
-            for i, doc in enumerate(results[:k]):
+            for i, doc in enumerate(results):
                 # Создаем объект, имитирующий ScoredPoint из Qdrant
                 # Сохраняем формат оригинального документа
                 payload = {
@@ -255,8 +302,16 @@ class HybridSearch:
                 # Дублируем и в text для обратной совместимости
                 payload['text'] = doc.page_content
                 
+                # Используем реальный score если доступен (после реранжирования)
+                score = 1.0 - (i * 0.1)  # Дефолтная оценка
+                if hasattr(doc, 'metadata') and doc.metadata:
+                    if 'rerank_score' in doc.metadata:
+                        score = doc.metadata['rerank_score']
+                    elif 'hybrid_rerank_score' in doc.metadata:
+                        score = doc.metadata['hybrid_rerank_score']
+                
                 result = type('ScoredPoint', (), {
-                    'score': 1.0 - (i * 0.1),  # Имитация оценки от 1.0 до 0.5
+                    'score': score,
                     'payload': payload,
                     'id': f"result_{i}"  # Добавляем ID для удобства отладки
                 })

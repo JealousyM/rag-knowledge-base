@@ -1,10 +1,10 @@
 [
   {
-    "timestamp": "2025-07-10 12:53:28",
-    "query": "Что такое RS.SCM",
-    "response": "**Ответ:** RS.SCM (Retail Solutions Supply Chain Management) - это система управления цепочкой поставок в розничной торговле. Она обеспечивает адаптацию стратегии управления запасами, прогнозирует спрос и позволяет эффективно управлять запасами через различные каналы продаж. Также RS.SCM включает методики прогнозирования и пополнения запасов, а также сервисы моделирования заказов для анализа плановых KPI.",
-    "rating": 2,
+    "timestamp": "2025-07-24 16:35:21",
+    "query": "Что такое RS.SCM?",
+    "response": "<div>RS.SCM - это система управления цепочкой поставок (Supply Chain Management), которая включает в себя различные документы и инструменты для оптимизации процессов распределения товаров и управления запасами.</div>",
+    "rating": "👎",
     "comments": "",
-    "run_id": null
+    "run_id": "<div style='margin-top: 20px;'><h4>Источники:</h4><div style='padding-left: 20px;'><div><div>D:\\Work\\inprogress\\rag\\data\\SCM_описание.pdf (стр. 303)</div><div style='color: #666; font-size: 0.9em; margin-top: 3px;'>типом \"Целевой\", без привязки к графику пополнения. \n \nПроверять доступность \nДля типа распределения...</div></div><div><div>D:\\Work\\inprogress\\rag\\data\\SCM_описание.pdf (стр. 284)</div><div style='color: #666; font-size: 0.9em; margin-top: 3px;'>пользователем.  \n При балансировке происходит перераспределение товаров таким образом, \nчтобы остатк...</div></div><div><div>D:\\Work\\inprogress\\rag\\data\\SCM_описание.pdf (стр. 297)</div><div style='color: #666; font-size: 0.9em; margin-top: 3px;'>магазинами для одинакового количества запасов в днях. \nЧто Если - распределение товара на выбранный ...</div></div><div><div>D:\\Work\\inprogress\\rag\\data\\Презентация RS.SCM АСТОР.pdf (стр. 12)</div><div style='color: #666; font-size: 0.9em; margin-top: 3px;'>библиотеке CatBoost (модель \nCatBoostRegressor). Этот класс моделей хорошо \nзарекомендовал себя для ...</div></div><div><div>D:\\Work\\inprogress\\rag\\data\\SCM_описание.pdf (стр. 231)</div><div style='color: #666; font-size: 0.9em; margin-top: 3px;'>параметров пополнения необходимо кликнуть по области на диаграмме \nСм.Изменение метода пополнения \n ...</div></div></div></div>"
   }
 ]
